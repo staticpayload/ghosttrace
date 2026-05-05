@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { execFile as execFileCallback } from 'node:child_process';
 import * as fs from 'node:fs';
 import { mkdtemp, rm, writeFile as seedWriteFile } from 'node:fs/promises';
 import {
@@ -13,11 +14,14 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SpanType, ghost, type Span } from '../../src/index.js';
 
 const tempRoots: string[] = [];
 const largeFileThresholdBytes = 256 * 1024;
+const execFile = promisify(execFileCallback);
 
 function fsSpans(spans: readonly Span[]): readonly Span[] {
   return spans.filter((span) => span.type === SpanType.Fs);
@@ -353,6 +357,65 @@ describe('filesystem interceptor', () => {
     expect(isRecord(largeResult) ? largeResult.contentBase64 : undefined).toBeUndefined();
   });
 
+  it('throws a descriptive contentRef error when large content is replayed in a fresh process', async () => {
+    const root = await tempRoot();
+    const largePath = join(root, 'large.bin');
+    const scriptPath = join(root, 'fresh-contentref-replay.ts');
+    const largeBytes = Buffer.alloc(largeFileThresholdBytes + 1, 0x63);
+    await seedWriteFile(largePath, largeBytes);
+
+    const trace = await ghost.record(
+      'fs-fresh-contentref-replay',
+      () => {
+        fs.readFileSync(largePath);
+        return 'recorded';
+      },
+      { interceptors: ['fs'] }
+    );
+    await rm(largePath);
+
+    await seedWriteFile(
+      scriptPath,
+      `
+        import * as fs from 'node:fs';
+        import { ghost } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'src/index.ts')).href)};
+
+        const traceText = process.env.GHOSTTRACE_TRACE;
+        const targetPath = process.env.GHOSTTRACE_PATH;
+        if (traceText === undefined || targetPath === undefined) {
+          throw new Error('missing fresh replay test environment');
+        }
+
+        void (async () => {
+          try {
+            await ghost.replay(JSON.parse(traceText), () => fs.readFileSync(targetPath));
+            console.error('expected contentRef replay to fail in a fresh process');
+            process.exit(1);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(message);
+            process.exit(message.includes('not available in the trace') ? 2 : 3);
+          }
+        })();
+      `,
+      'utf8'
+    );
+
+    await expect(
+      execFile(process.execPath, ['--import', 'tsx', scriptPath], {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          GHOSTTRACE_PATH: largePath,
+          GHOSTTRACE_TRACE: JSON.stringify(trace)
+        }
+      })
+    ).rejects.toMatchObject({
+      code: 2,
+      stderr: expect.stringContaining('not available in the trace')
+    });
+  });
+
   it('replays recorded reads without disk access after files are deleted', async () => {
     const root = await tempRoot();
     const source = join(root, 'recorded.txt');
@@ -398,6 +461,38 @@ describe('filesystem interceptor', () => {
       'fs.statSync',
       'fs.accessSync'
     ]);
+  });
+
+  it('replays callback-style FS operations asynchronously', async () => {
+    const root = await tempRoot();
+    const source = join(root, 'recorded.txt');
+    await seedWriteFile(source, 'recorded-content', 'utf8');
+
+    const trace = await ghost.record(
+      'fs-callback-async-replay',
+      () => readFileCallback(source),
+      { interceptors: ['fs'] }
+    );
+    await rm(root, { recursive: true, force: true });
+
+    const replayed = await ghost.replay(trace, () => {
+      const order: string[] = [];
+
+      return new Promise<readonly string[]>((resolve, reject) => {
+        fs.readFile(source, 'utf8', (error) => {
+          order.push('callback');
+          if (error !== null) {
+            reject(error);
+            return;
+          }
+
+          resolve([...order]);
+        });
+        order.push('after-registration');
+      });
+    });
+
+    expect(replayed.output).toEqual(['after-registration', 'callback']);
   });
 
   it('makes writeFile a no-op during replay across sync, promises, and callback APIs', async () => {

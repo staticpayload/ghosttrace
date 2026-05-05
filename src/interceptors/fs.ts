@@ -643,6 +643,24 @@ function errorFromSpan(span: Span): Error | null {
   return error;
 }
 
+function scheduleReplayCallback(callback: FsCallback, args: readonly unknown[]): void {
+  const invoke = (): void => {
+    Reflect.apply(callback, undefined, [...args]);
+  };
+
+  if (typeof setImmediate === 'function') {
+    setImmediate(invoke);
+    return;
+  }
+
+  if (typeof process !== 'undefined' && typeof process.nextTick === 'function') {
+    process.nextTick(invoke);
+    return;
+  }
+
+  queueMicrotask(invoke);
+}
+
 function deserializeSpanValue(value: unknown): unknown {
   return deserialize(value as SerializedJsonValue);
 }
@@ -659,7 +677,7 @@ function contentFromRecord(value: unknown, span: Span, traceId: string): string 
   if (isRecord(value.contentRef) && typeof value.contentRef.hash === 'string') {
     const stored = replayLargeContent.get(contentStoreKey(traceId, value.contentRef.hash));
     if (stored === undefined) {
-      throw new ReplayMismatchError(`Large content for recorded FS span ${span.name} is unavailable for replay`, {
+      throw new ReplayMismatchError(`Large file content for recorded FS span ${span.name} is not available in the trace`, {
         traceId,
         spanId: span.id,
         context: { contentRef: value.contentRef }
@@ -813,17 +831,17 @@ function replayCallbackOperation(
   const callback = args[index] as FsCallback;
   const error = errorFromSpan(span);
   if (error !== null) {
-    Reflect.apply(callback, undefined, [error]);
+    scheduleReplayCallback(callback, [error]);
     return undefined;
   }
 
   const result = replayResult(active, entry, span);
   if (entry.operation === 'readFile' || entry.operation === 'readdir' || entry.operation === 'stat' || entry.operation === 'mkdir') {
-    Reflect.apply(callback, undefined, [null, result]);
+    scheduleReplayCallback(callback, [null, result]);
     return undefined;
   }
 
-  Reflect.apply(callback, undefined, [null]);
+  scheduleReplayCallback(callback, [null]);
   return undefined;
 }
 
