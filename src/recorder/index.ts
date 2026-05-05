@@ -14,9 +14,12 @@ import {
   type TraceableFunction
 } from '../core/types.js';
 import {
+  envInterceptor,
   fsInterceptor,
   functionInterceptor,
   httpInterceptor,
+  randomInterceptor,
+  timerInterceptor,
   type Interceptor,
   type InterceptorContext,
   type Teardown
@@ -40,7 +43,14 @@ interface MutableSpanError {
   cause?: SpanError;
 }
 
-const defaultInterceptors = [functionInterceptor, httpInterceptor, fsInterceptor] as const;
+const defaultInterceptors = [
+  functionInterceptor,
+  httpInterceptor,
+  fsInterceptor,
+  timerInterceptor,
+  randomInterceptor,
+  envInterceptor
+] as const;
 const interceptorRegistry = new Map<string, Interceptor>(
   defaultInterceptors.map((interceptor) => [interceptor.name, interceptor])
 );

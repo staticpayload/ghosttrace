@@ -30,6 +30,7 @@ import {
 } from './core/types.js';
 import { wrap, wrapModule } from './interceptors/function.js';
 import { record, registerInterceptor } from './recorder/index.js';
+import { replay as replayTrace } from './replay/index.js';
 import { VERSION } from './version.js';
 
 export { VERSION } from './version.js';
@@ -95,7 +96,7 @@ export {
   type Tracer
 } from './core/types.js';
 export type { Interceptor, InterceptorContext, Teardown } from './interceptors/index.js';
-export { functionInterceptor, httpInterceptor, fsInterceptor, wrap, wrapModule } from './interceptors/index.js';
+export { functionInterceptor, httpInterceptor, fsInterceptor, timerInterceptor, randomInterceptor, envInterceptor, wrap, wrapModule } from './interceptors/index.js';
 export { record, registerInterceptor } from './recorder/index.js';
 
 function cloneMetadata(metadata: TraceMetadata | undefined): TraceMetadata {
@@ -120,13 +121,6 @@ function normalizeConfig(config: GhostTraceConfig): GhostTraceConfig {
   }
 
   return normalized;
-}
-
-function notImplemented(featureName: string): GhostTraceError {
-  return new GhostTraceError(`${featureName} is not implemented in the foundation package setup yet`, {
-    code: 'GHOSTTRACE_NOT_IMPLEMENTED',
-    context: { featureName }
-  });
 }
 
 /** Creates a Trace object with deterministic foundation defaults. */
@@ -159,10 +153,7 @@ export async function replay<TOutput, TSpan extends Span = Span>(
   fn: TraceableFunction<TOutput>,
   options: ReplayOptions = {}
 ): Promise<ReplayResult<Awaited<TOutput>, TSpan>> {
-  void trace;
-  void fn;
-  void options;
-  throw notImplemented('replay');
+  return replayTrace(trace, fn, options);
 }
 
 /** Returns an isolated GhostTrace API instance with captured configuration. */

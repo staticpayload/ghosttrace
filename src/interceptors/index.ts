@@ -3,3 +3,6 @@ export { noopTeardown } from './types.js';
 export { functionInterceptor, wrap, wrapModule } from './function.js';
 export { httpInterceptor } from './http.js';
 export { fsInterceptor } from './fs.js';
+export { timerInterceptor } from './timer.js';
+export { randomInterceptor } from './random.js';
+export { envInterceptor } from './env.js';
