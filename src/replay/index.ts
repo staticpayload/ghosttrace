@@ -9,9 +9,12 @@ import {
   type TraceableFunction
 } from '../core/types.js';
 import {
+  dbInterceptor,
   envInterceptor,
   fsInterceptor,
+  httpInterceptor,
   performanceInterceptor,
+  queueInterceptor,
   randomInterceptor,
   timerInterceptor,
   type Interceptor,
@@ -28,7 +31,10 @@ const replayInterceptors: readonly ReplayInterceptorEntry[] = [
   { type: SpanType.Timer, interceptor: timerInterceptor },
   { type: SpanType.Random, interceptor: randomInterceptor },
   { type: SpanType.Env, interceptor: envInterceptor },
+  { type: SpanType.Http, interceptor: httpInterceptor },
   { type: SpanType.Fs, interceptor: fsInterceptor },
+  { type: SpanType.Db, interceptor: dbInterceptor },
+  { type: SpanType.Queue, interceptor: queueInterceptor },
   { type: SpanType.Performance, interceptor: performanceInterceptor }
 ];
 
@@ -71,7 +77,7 @@ function teardownReplayInterceptors(teardowns: readonly Teardown[]): void {
   }
 }
 
-/** Replays deterministic timer, random, env, and filesystem spans against a trace object. */
+/** Replays deterministic side-effect spans against a trace object. */
 export async function replay<TOutput, TSpan extends Span = Span>(
   trace: Trace<TSpan> | string,
   fn: TraceableFunction<TOutput>,

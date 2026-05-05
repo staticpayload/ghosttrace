@@ -1,7 +1,8 @@
 import { getTraceContext, runWithSpanContext, type TraceContext } from '../core/context.js';
-import { serialize } from '../core/serializer.js';
+import { deserialize, serialize, type SerializedJsonValue } from '../core/serializer.js';
 import { SpanType, type Span, type SpanMetadata } from '../core/types.js';
-import { spanErrorFromUnknown } from './shared.js';
+import { isRecord, spanErrorFromUnknown } from './shared.js';
+import { isReplayStore, type ReplayStore } from '../replay/store.js';
 import type { Interceptor, InterceptorContext, Teardown } from './types.js';
 import { noopTeardown } from './types.js';
 
@@ -48,6 +49,7 @@ interface ActiveQueueSession {
 interface ActiveQueueContext {
   readonly context: TraceContext;
   readonly session: ActiveQueueSession;
+  readonly replayStore?: ReplayStore;
 }
 
 interface QueueInvocationMetadata {
@@ -65,13 +67,22 @@ function markQueueInterceptorBundled(): string {
 function activeQueueContext(): ActiveQueueContext | undefined {
   const context = getTraceContext();
 
-  if (context === undefined || context.mode !== 'record') {
+  if (context === undefined) {
     return undefined;
   }
 
   const session = activeQueueSessions.get(context.traceId);
   if (session === undefined) {
     return undefined;
+  }
+
+  if (context.mode === 'replay') {
+    const replayStore = isReplayStore(context.replayStore) ? context.replayStore : undefined;
+    if (replayStore === undefined || !replayStore.canReplay(SpanType.Queue)) {
+      return undefined;
+    }
+
+    return { context, session, replayStore };
   }
 
   return { context, session };
@@ -235,6 +246,69 @@ function completeInvocation(active: ActiveQueueContext, span: Span, output: unkn
   active.session.addSpan(completeQueueSpan(active.context, span, output, error));
 }
 
+function deserializeSpanValue(value: unknown): unknown {
+  return deserialize(value as SerializedJsonValue);
+}
+
+function errorFromSpan(span: Span): Error | null {
+  if (span.error === null) {
+    return null;
+  }
+
+  const error = new Error(span.error.message) as Error & { code?: string };
+  error.name = span.error.name;
+  if (span.error.code !== undefined) {
+    error.code = span.error.code;
+  }
+
+  return error;
+}
+
+function isAsyncClientMethod(method: ClientMethod): boolean {
+  return method.constructor.name === 'AsyncFunction';
+}
+
+function replayMethodValue(targetMethod: ClientMethod, value: unknown): unknown {
+  return isAsyncClientMethod(targetMethod) ? Promise.resolve(value) : value;
+}
+
+function replayMethodError(targetMethod: ClientMethod, error: Error): unknown {
+  if (isAsyncClientMethod(targetMethod)) {
+    return Promise.reject(error);
+  }
+
+  throw error;
+}
+
+function queueReturnValueFromOutput(output: unknown): unknown {
+  const value = deserializeSpanValue(output);
+  if (!isRecord(value) || !('result' in value)) {
+    return value;
+  }
+
+  return value.result;
+}
+
+function invokeReplayedQueueMethod(
+  active: ActiveQueueContext,
+  targetMethod: ClientMethod,
+  thisArg: unknown,
+  args: readonly unknown[],
+  metadata: QueueInvocationMetadata
+): unknown {
+  const span = active.replayStore?.consumeSpan(SpanType.Queue, metadata.name, metadata.input)?.span;
+  if (span === undefined) {
+    return Reflect.apply(targetMethod, thisArg, [...args]);
+  }
+
+  const error = errorFromSpan(span);
+  if (error !== null) {
+    return replayMethodError(targetMethod, error);
+  }
+
+  return replayMethodValue(targetMethod, queueReturnValueFromOutput(span.output));
+}
+
 function invokeRecordedQueueMethod(
   active: ActiveQueueContext,
   targetMethod: ClientMethod,
@@ -300,6 +374,10 @@ export function wrapQueue<TClient extends object>(client: TClient, adapter: Queu
         }
 
         const metadata = queueInvocationMetadata(adapter, descriptor, args);
+        if (active.context.mode === 'replay') {
+          return invokeReplayedQueueMethod(active, value, thisArg, args, metadata);
+        }
+
         return invokeRecordedQueueMethod(active, value, thisArg, args, metadata, (result) =>
           queueOutput(descriptor, args, result)
         );

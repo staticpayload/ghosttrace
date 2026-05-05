@@ -358,6 +358,104 @@ describe('DB, queue, and performance interceptors', () => {
     });
   });
 
+  it('replays DB and queue operations from recorded spans without calling live clients', async () => {
+    const db = wrapDb(createDbClient(), createDbAdapter());
+    const queue = wrapQueue(createQueueClient(), createQueueAdapter());
+
+    const trace = await ghost.record(
+      'db-queue-replay',
+      async () => {
+        const selected = await db.query('SELECT * FROM users WHERE id = ?', [7]);
+        const message = await queue.receive('jobs');
+        let dbError = 'missing db error';
+        let queueError = 'missing queue error';
+
+        try {
+          await db.query('SELECT FAIL', []);
+        } catch (error) {
+          dbError = error instanceof Error ? error.message : String(error);
+        }
+
+        try {
+          await queue.nack('jobs', 'msg-4', 'explode');
+        } catch (error) {
+          queueError = error instanceof Error ? error.message : String(error);
+        }
+
+        return {
+          firstRow: selected.rows[0],
+          rowCount: selected.rowCount,
+          message,
+          dbError,
+          queueError
+        };
+      },
+      { interceptors: ['db', 'queue'] }
+    );
+
+    const liveDbQuery = vi.fn(async (): Promise<QueryResult> => {
+      throw new Error('live db query should not run during replay');
+    });
+    const liveDbClient: FakeDbClient = {
+      query: liveDbQuery,
+      begin: vi.fn(async () => 'live-tx'),
+      commit: vi.fn(async (transactionId: string) => ({ transactionId })),
+      rollback: vi.fn(async (transactionId: string) => ({ transactionId }))
+    };
+    const liveQueueReceive = vi.fn(async (): Promise<QueueMessage> => {
+      throw new Error('live queue receive should not run during replay');
+    });
+    const liveQueueNack = vi.fn(async (): Promise<{ readonly requeued: false }> => {
+      throw new Error('live queue nack should not run during replay');
+    });
+    const liveQueueClient: FakeQueueClient = {
+      send: vi.fn(async () => ({ id: 'live-msg' })),
+      receive: liveQueueReceive,
+      ack: vi.fn(async (): Promise<{ readonly acknowledged: true }> => ({ acknowledged: true })),
+      nack: liveQueueNack
+    };
+    const replayDb = wrapDb(liveDbClient, createDbAdapter());
+    const replayQueue = wrapQueue(liveQueueClient, createQueueAdapter());
+
+    const replayed = await ghost.replay(trace, async () => {
+      const selected = await replayDb.query('SELECT * FROM users WHERE id = ?', [7]);
+      const message = await replayQueue.receive('jobs');
+      let dbError = 'missing db error';
+      let queueError = 'missing queue error';
+
+      try {
+        await replayDb.query('SELECT FAIL', []);
+      } catch (error) {
+        dbError = error instanceof Error ? error.message : String(error);
+      }
+
+      try {
+        await replayQueue.nack('jobs', 'msg-4', 'explode');
+      } catch (error) {
+        queueError = error instanceof Error ? error.message : String(error);
+      }
+
+      return {
+        firstRow: selected.rows[0],
+        rowCount: selected.rowCount,
+        message,
+        dbError,
+        queueError
+      };
+    });
+
+    expect(replayed.output).toEqual(deserializeAs(trace.spans[0]?.output));
+    expect(replayed.spansMatched.map((match) => match.span.name)).toEqual([
+      'db.query',
+      'queue.receive',
+      'db.query',
+      'queue.nack'
+    ]);
+    expect(liveDbQuery).not.toHaveBeenCalled();
+    expect(liveQueueReceive).not.toHaveBeenCalled();
+    expect(liveQueueNack).not.toHaveBeenCalled();
+  });
+
   it('records and replays performance.now, mark, and measure with exact values', async () => {
     const originalNow = performance.now;
 

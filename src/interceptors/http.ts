@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { PassThrough } from 'node:stream';
 import type {
   ClientRequest,
   IncomingHttpHeaders,
@@ -8,8 +9,10 @@ import type {
   RequestOptions
 } from 'node:http';
 import { getTraceContext, runWithSpanContext, type TraceContext } from '../core/context.js';
-import { serialize } from '../core/serializer.js';
+import { ReplayMismatchError } from '../core/errors.js';
+import { deserialize, serialize, type SerializedJsonValue } from '../core/serializer.js';
 import { SpanType, type Span, type SpanError } from '../core/types.js';
+import { isReplayStore, type ReplayStore } from '../replay/store.js';
 import type { Interceptor, InterceptorContext, Teardown } from './types.js';
 
 const HTTP_SENTINEL = '__GHOSTTRACE_HTTP_INTERCEPTOR_SENTINEL__';
@@ -35,6 +38,7 @@ interface ActiveHttpSession {
 interface ActiveHttpContext {
   readonly context: TraceContext;
   readonly session: ActiveHttpSession;
+  readonly replayStore?: ReplayStore;
 }
 
 interface MutableSpanError {
@@ -94,6 +98,11 @@ interface NodeRequestDetails {
 interface MutableClientRequestMethods {
   write: (this: ClientRequest, ...args: unknown[]) => boolean;
   end: (this: ClientRequest, ...args: unknown[]) => ClientRequest;
+}
+
+interface MutableReplayClientRequestMethods extends MutableClientRequestMethods {
+  setTimeout: (this: ClientRequest, timeout: number, callback?: () => void) => ClientRequest;
+  abort: (this: ClientRequest) => void;
 }
 
 type MutableSpan = { -readonly [Key in keyof Span]: Span[Key] };
@@ -564,13 +573,22 @@ function abortSpanError(message: string): SpanError {
 function activeHttpContext(): ActiveHttpContext | undefined {
   const context = getTraceContext();
 
-  if (context === undefined || context.mode !== 'record') {
+  if (context === undefined) {
     return undefined;
   }
 
   const session = activeHttpSessions.get(context.traceId);
   if (session === undefined) {
     return undefined;
+  }
+
+  if (context.mode === 'replay') {
+    const replayStore = isReplayStore(context.replayStore) ? context.replayStore : undefined;
+    if (replayStore === undefined || !replayStore.canReplay(SpanType.Http)) {
+      return undefined;
+    }
+
+    return { context, session, replayStore };
   }
 
   return { context, session };
@@ -840,6 +858,177 @@ function fetchAvailable(): boolean {
   return typeof globalThis.fetch === 'function';
 }
 
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function deserializeSpanValue(value: unknown): unknown {
+  return deserialize(value as SerializedJsonValue);
+}
+
+function replayMismatch(span: Span, message: string, context: Record<string, unknown>): ReplayMismatchError {
+  return new ReplayMismatchError(message, {
+    spanId: span.id,
+    context
+  });
+}
+
+function errorFromSpan(span: Span): Error | null {
+  if (span.error === null) {
+    return null;
+  }
+
+  const error = new Error(span.error.message) as Error & { code?: string };
+  error.name = span.error.name;
+  if (span.error.code !== undefined) {
+    error.code = span.error.code;
+  }
+
+  return error;
+}
+
+function outputRecordFromSpan(span: Span): Readonly<Record<string, unknown>> {
+  const output = deserializeSpanValue(span.output);
+  if (!isRecord(output)) {
+    throw replayMismatch(span, `Recorded HTTP span ${span.name} is missing response output`, {
+      output: span.output
+    });
+  }
+
+  return output;
+}
+
+function statusFromOutput(output: Readonly<Record<string, unknown>>): number {
+  return typeof output.status === 'number' && Number.isInteger(output.status) && output.status >= 200 && output.status <= 599
+    ? output.status
+    : 200;
+}
+
+function statusMessageFromOutput(output: Readonly<Record<string, unknown>>): string | undefined {
+  const statusMessage = output.statusText ?? output.statusMessage;
+  return typeof statusMessage === 'string' ? statusMessage : undefined;
+}
+
+function headersFromOutput(headers: unknown): HeadersInit {
+  const record: Record<string, string> = {};
+  if (!isRecord(headers)) {
+    return record;
+  }
+
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof value === 'string') {
+      record[key] = value;
+    } else if (Array.isArray(value)) {
+      record[key] = value.map((item) => String(item)).join(', ');
+    }
+  }
+
+  return record;
+}
+
+function incomingHeadersFromOutput(headers: unknown): IncomingHttpHeaders {
+  const record: IncomingHttpHeaders = {};
+  if (!isRecord(headers)) {
+    return record;
+  }
+
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof value === 'string') {
+      record[key.toLowerCase()] = value;
+    } else if (Array.isArray(value)) {
+      record[key.toLowerCase()] = value.map((item) => String(item));
+    }
+  }
+
+  return record;
+}
+
+function bodyFromRecordedValue(body: unknown): BodyInit | null | undefined {
+  if (body === undefined || body === null) {
+    return body;
+  }
+  if (
+    typeof body === 'string' ||
+    body instanceof ArrayBuffer ||
+    (typeof Blob !== 'undefined' && body instanceof Blob) ||
+    (typeof FormData !== 'undefined' && body instanceof FormData) ||
+    (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) ||
+    isReadableStream(body)
+  ) {
+    return body;
+  }
+  if (ArrayBuffer.isView(body)) {
+    const source = new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+    const copy = new Uint8Array(source.byteLength);
+    copy.set(source);
+    return copy.buffer;
+  }
+  if (isRecord(body)) {
+    if (typeof body.text === 'string') {
+      return body.text;
+    }
+    if (typeof body.content === 'string') {
+      return body.content;
+    }
+    if (typeof body.contentBase64 === 'string') {
+      return Buffer.from(body.contentBase64, 'base64');
+    }
+    if (body.deferred === true || body.unavailable === true) {
+      return undefined;
+    }
+  }
+
+  return String(body);
+}
+
+function bufferFromRecordedBody(body: unknown): Buffer | undefined {
+  const replayBody = bodyFromRecordedValue(body);
+  if (replayBody === undefined || replayBody === null) {
+    return undefined;
+  }
+  if (typeof replayBody === 'string') {
+    return Buffer.from(replayBody, 'utf8');
+  }
+  if (replayBody instanceof ArrayBuffer) {
+    return Buffer.from(replayBody);
+  }
+  if (ArrayBuffer.isView(replayBody)) {
+    return Buffer.from(replayBody.buffer, replayBody.byteOffset, replayBody.byteLength);
+  }
+
+  return Buffer.from(String(replayBody), 'utf8');
+}
+
+function responseFromSpan(span: Span): Response {
+  const error = errorFromSpan(span);
+  if (error !== null) {
+    throw error;
+  }
+
+  const output = outputRecordFromSpan(span);
+  const responseInit: ResponseInit = {
+    status: statusFromOutput(output),
+    headers: headersFromOutput(output.headers)
+  };
+  const statusText = statusMessageFromOutput(output);
+  if (statusText !== undefined) {
+    responseInit.statusText = statusText;
+  }
+
+  return new Response(bodyFromRecordedValue(output.body) ?? null, responseInit);
+}
+
+async function replayFetch(active: ActiveHttpContext, input: RequestInfo | URL, init: RequestInit | undefined): Promise<Response> {
+  const inputDetails = await fetchInputDetails(input, init);
+  const span = active.replayStore?.consumeSpan(SpanType.Http, 'fetch', inputDetails)?.span;
+
+  if (span === undefined) {
+    return fetchImplementation()(input, init);
+  }
+
+  return responseFromSpan(span);
+}
+
 function installGlobalFetchPatch(): void {
   if (patchedFetch !== undefined || !fetchAvailable()) {
     return;
@@ -852,6 +1041,9 @@ function installGlobalFetchPatch(): void {
 
     if (active === undefined) {
       return fetch(input, init);
+    }
+    if (active.context.mode === 'replay') {
+      return replayFetch(active, input, init);
     }
 
     const preparedRequest = prepareLazyRequestObjectInput(input, init);
@@ -1158,6 +1350,113 @@ function instrumentClientRequest(
   return request;
 }
 
+type NodeResponseCallback = (response: IncomingMessage) => void;
+
+function nodeRequestName(protocol: RequestProtocol): string {
+  return `${protocol === 'http:' ? 'http' : 'https'}.request`;
+}
+
+function nodeReplayInputDetails(protocol: RequestProtocol, args: readonly unknown[]): Record<string, unknown> {
+  return {
+    ...nodeRequestDetails(protocol, args),
+    body: undefined
+  };
+}
+
+function responseCallbackFromArgs(args: readonly unknown[]): NodeResponseCallback | undefined {
+  const callback = args.find((arg): arg is NodeResponseCallback => typeof arg === 'function');
+  return callback;
+}
+
+function scheduleReplayTask(task: () => void): void {
+  if (typeof process !== 'undefined' && typeof process.nextTick === 'function') {
+    process.nextTick(task);
+    return;
+  }
+
+  queueMicrotask(task);
+}
+
+function replayIncomingMessage(output: Readonly<Record<string, unknown>>): IncomingMessage {
+  const response = new PassThrough() as unknown as IncomingMessage;
+  const mutableResponse = response as IncomingMessage & {
+    statusCode: number;
+    statusMessage: string;
+    headers: IncomingHttpHeaders;
+  };
+
+  mutableResponse.statusCode = statusFromOutput(output);
+  mutableResponse.statusMessage = statusMessageFromOutput(output) ?? '';
+  mutableResponse.headers = incomingHeadersFromOutput(output.headers);
+  return response;
+}
+
+function createReplayClientRequest(span: Span, args: readonly unknown[]): ClientRequest {
+  const request = new PassThrough() as unknown as ClientRequest;
+  const mutableRequest = request as unknown as MutableReplayClientRequestMethods;
+  const responseCallback = responseCallbackFromArgs(args);
+
+  mutableRequest.write = function ghosttraceReplayRequestWrite(): boolean {
+    return true;
+  };
+  mutableRequest.end = function ghosttraceReplayRequestEnd(this: ClientRequest): ClientRequest {
+    return this;
+  };
+  mutableRequest.setTimeout = function ghosttraceReplayRequestSetTimeout(
+    this: ClientRequest,
+    _timeout: number,
+    callback?: () => void
+  ): ClientRequest {
+    if (callback !== undefined) {
+      this.once('timeout', callback);
+    }
+
+    return this;
+  };
+  mutableRequest.abort = function ghosttraceReplayRequestAbort(this: ClientRequest): void {
+    this.destroy(new Error('HTTP replay request aborted'));
+  };
+
+  scheduleReplayTask(() => {
+    const error = errorFromSpan(span);
+    if (error !== null) {
+      request.emit('error', error);
+      return;
+    }
+
+    const output = outputRecordFromSpan(span);
+    const response = replayIncomingMessage(output);
+    const body = bufferFromRecordedBody(output.body);
+
+    responseCallback?.(response);
+    request.emit('response', response);
+    (response as unknown as PassThrough).end(body);
+  });
+
+  return request;
+}
+
+function replayNodeRequest(
+  active: ActiveHttpContext,
+  protocol: RequestProtocol,
+  target: object,
+  getOriginal: () => NodeRequestFunction | undefined,
+  args: readonly unknown[]
+): ClientRequest {
+  const original = getOriginal();
+  if (original === undefined) {
+    throw new TypeError(`${protocol === 'http:' ? 'http' : 'https'}.request is not available`);
+  }
+
+  const name = nodeRequestName(protocol);
+  const span = active.replayStore?.consumeSpan(SpanType.Http, name, nodeReplayInputDetails(protocol, args))?.span;
+  if (span === undefined) {
+    return callNodeRequest(original, target, args);
+  }
+
+  return createReplayClientRequest(span, args);
+}
+
 function createPatchedNodeRequest(
   protocol: RequestProtocol,
   target: object,
@@ -1173,9 +1472,12 @@ function createPatchedNodeRequest(
     if (active === undefined) {
       return callNodeRequest(original, target, args);
     }
+    if (active.context.mode === 'replay') {
+      return replayNodeRequest(active, protocol, target, getOriginal, args);
+    }
 
     const details = nodeRequestDetails(protocol, args);
-    const span = pendingHttpSpan(active.context, `${protocol === 'http:' ? 'http' : 'https'}.request`, details);
+    const span = pendingHttpSpan(active.context, nodeRequestName(protocol), details);
 
     try {
       const request = runWithSpanContext(span, () => callNodeRequest(original, target, args));

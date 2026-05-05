@@ -1,7 +1,7 @@
 import * as http from 'node:http';
 import * as https from 'node:https';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { SpanType, ghost, type Span } from '../../src/index.js';
+import { SpanType, deserialize, ghost, type SerializedJsonValue, type Span } from '../../src/index.js';
 
 interface Deferred<TValue> {
   readonly promise: Promise<TValue>;
@@ -40,6 +40,10 @@ function fetchUrls(spans: readonly Span[]): readonly string[] {
 
 function httpSpans(spans: readonly Span[]): readonly Span[] {
   return spans.filter((span) => span.type === SpanType.Http);
+}
+
+function deserializeAs<TValue>(value: unknown): TValue {
+  return deserialize(value as SerializedJsonValue) as TValue;
 }
 
 function requireRecord(value: unknown, label: string): Readonly<Record<string, unknown>> {
@@ -321,6 +325,87 @@ describe('HTTP interceptor', () => {
       },
       error: null
     });
+  });
+
+  it('replays fetch responses without live network access and restores the fetch stub after replay errors', async () => {
+    const recordedFetch = vi.fn(async () =>
+      new Response(JSON.stringify({ source: 'recorded' }), {
+        status: 203,
+        statusText: 'Non-Authoritative Information',
+        headers: {
+          'content-type': 'application/json',
+          'x-replayed': 'yes'
+        }
+      })
+    );
+    vi.stubGlobal('fetch', recordedFetch);
+
+    const trace = await ghost.record(
+      'fetch-replay-without-network',
+      async () => {
+        const response = await fetch('https://api.example.test/replay', {
+          method: 'POST',
+          headers: {
+            'x-request': 'recorded'
+          },
+          body: 'recorded-body'
+        });
+        const json = (await response.json()) as { readonly source: string };
+
+        return {
+          status: response.status,
+          statusText: response.statusText,
+          replayedHeader: response.headers.get('x-replayed'),
+          json
+        };
+      },
+      { interceptors: ['http'] }
+    );
+    const blockedFetch = vi.fn(async () => {
+      throw new Error('live network should not be called during replay');
+    });
+    vi.stubGlobal('fetch', blockedFetch);
+    const fetchBeforeReplay = globalThis.fetch;
+    const expectedOutput = deserializeAs(trace.spans[0]?.output);
+
+    const replayed = await ghost.replay(trace, async () => {
+      expect(globalThis.fetch).not.toBe(fetchBeforeReplay);
+      const response = await fetch('https://api.example.test/replay', {
+        method: 'POST',
+        headers: {
+          'x-request': 'recorded'
+        },
+        body: 'recorded-body'
+      });
+      const json = (await response.json()) as { readonly source: string };
+
+      return {
+        status: response.status,
+        statusText: response.statusText,
+        replayedHeader: response.headers.get('x-replayed'),
+        json
+      };
+    });
+
+    expect(replayed.output).toEqual(expectedOutput);
+    expect(replayed.spansMatched.map((match) => match.span.name)).toEqual(['fetch']);
+    expect(blockedFetch).not.toHaveBeenCalled();
+    expect(globalThis.fetch).toBe(fetchBeforeReplay);
+
+    await expect(
+      ghost.replay(trace, async () => {
+        await fetch('https://api.example.test/replay', {
+          method: 'POST',
+          headers: {
+            'x-request': 'recorded'
+          },
+          body: 'recorded-body'
+        });
+        throw new Error('user replay failure');
+      })
+    ).rejects.toThrow('user replay failure');
+    expect(blockedFetch).not.toHaveBeenCalled();
+    expect(globalThis.fetch).toBe(fetchBeforeReplay);
   });
 
   it('dispatches fetch with a streaming Request body before the body closes and still captures the body', async () => {
@@ -620,6 +705,28 @@ describe('HTTP interceptor', () => {
     } finally {
       await closeServer(server);
     }
+  });
+
+  it('replays node http.request responses without contacting the recorded server', async () => {
+    const server = http.createServer((_request, response) => {
+      response.writeHead(209, {
+        'content-type': 'text/plain',
+        'x-node-replay': 'yes'
+      });
+      response.end('node-recorded-body');
+    });
+
+    const port = await listenOnEphemeralPort(server);
+    const url = `http://127.0.0.1:${port}/node-replay`;
+    const trace = await ghost.record('node-request-replay', () => requestText(url), {
+      interceptors: ['http']
+    });
+    await closeServer(server);
+
+    const replayed = await ghost.replay(trace, () => requestText(url));
+
+    expect(replayed.output).toBe('node-recorded-body');
+    expect(replayed.spansMatched.map((match) => match.span.name)).toEqual(['http.request']);
   });
 
   it('records node http request timeouts as errored HTTP spans', async () => {

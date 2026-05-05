@@ -1,7 +1,8 @@
 import { getTraceContext, runWithSpanContext, type TraceContext } from '../core/context.js';
-import { serialize } from '../core/serializer.js';
+import { deserialize, serialize, type SerializedJsonValue } from '../core/serializer.js';
 import { SpanType, type Span, type SpanMetadata } from '../core/types.js';
-import { spanErrorFromUnknown } from './shared.js';
+import { isRecord, spanErrorFromUnknown } from './shared.js';
+import { isReplayStore, type ReplayStore } from '../replay/store.js';
 import type { Interceptor, InterceptorContext, Teardown } from './types.js';
 import { noopTeardown } from './types.js';
 
@@ -68,6 +69,7 @@ interface ActiveDbSession {
 interface ActiveDbContext {
   readonly context: TraceContext;
   readonly session: ActiveDbSession;
+  readonly replayStore?: ReplayStore;
 }
 
 interface DbInvocationMetadata {
@@ -85,13 +87,22 @@ function markDbInterceptorBundled(): string {
 function activeDbContext(): ActiveDbContext | undefined {
   const context = getTraceContext();
 
-  if (context === undefined || context.mode !== 'record') {
+  if (context === undefined) {
     return undefined;
   }
 
   const session = activeDbSessions.get(context.traceId);
   if (session === undefined) {
     return undefined;
+  }
+
+  if (context.mode === 'replay') {
+    const replayStore = isReplayStore(context.replayStore) ? context.replayStore : undefined;
+    if (replayStore === undefined || !replayStore.canReplay(SpanType.Db)) {
+      return undefined;
+    }
+
+    return { context, session, replayStore };
   }
 
   return { context, session };
@@ -307,6 +318,76 @@ function completeInvocation(
   active.session.addSpan(completeDbSpan(active.context, span, output, error));
 }
 
+function deserializeSpanValue(value: unknown): unknown {
+  return deserialize(value as SerializedJsonValue);
+}
+
+function errorFromSpan(span: Span): Error | null {
+  if (span.error === null) {
+    return null;
+  }
+
+  const error = new Error(span.error.message) as Error & { code?: string };
+  error.name = span.error.name;
+  if (span.error.code !== undefined) {
+    error.code = span.error.code;
+  }
+
+  return error;
+}
+
+function isAsyncClientMethod(method: ClientMethod): boolean {
+  return method.constructor.name === 'AsyncFunction';
+}
+
+function replayMethodValue(targetMethod: ClientMethod, value: unknown): unknown {
+  return isAsyncClientMethod(targetMethod) ? Promise.resolve(value) : value;
+}
+
+function replayMethodError(targetMethod: ClientMethod, error: Error): unknown {
+  if (isAsyncClientMethod(targetMethod)) {
+    return Promise.reject(error);
+  }
+
+  throw error;
+}
+
+function dbReturnValueFromOutput(output: unknown): unknown {
+  const value = deserializeSpanValue(output);
+  if (!isRecord(value) || !('result' in value)) {
+    return value;
+  }
+
+  if (Array.isArray(value.result) && typeof value.rowCount === 'number') {
+    return {
+      rows: value.result,
+      rowCount: value.rowCount
+    };
+  }
+
+  return value.result;
+}
+
+function invokeReplayedDbMethod(
+  active: ActiveDbContext,
+  targetMethod: ClientMethod,
+  thisArg: unknown,
+  args: readonly unknown[],
+  metadata: DbInvocationMetadata
+): unknown {
+  const span = active.replayStore?.consumeSpan(SpanType.Db, metadata.name, metadata.input)?.span;
+  if (span === undefined) {
+    return Reflect.apply(targetMethod, thisArg, [...args]);
+  }
+
+  const error = errorFromSpan(span);
+  if (error !== null) {
+    return replayMethodError(targetMethod, error);
+  }
+
+  return replayMethodValue(targetMethod, dbReturnValueFromOutput(span.output));
+}
+
 function invokeRecordedDbMethod(
   active: ActiveDbContext,
   targetMethod: ClientMethod,
@@ -380,6 +461,10 @@ export function wrapDb<TClient extends object>(client: TClient, adapter: DbAdapt
 
         if (operationDescriptor !== undefined) {
           const metadata = queryInvocationMetadata(adapter, operationDescriptor, args);
+          if (active.context.mode === 'replay') {
+            return invokeReplayedDbMethod(active, value, thisArg, args, metadata);
+          }
+
           return invokeRecordedDbMethod(active, value, thisArg, args, metadata, (result) =>
             queryOutput(operationDescriptor, args, result)
           );
@@ -387,6 +472,10 @@ export function wrapDb<TClient extends object>(client: TClient, adapter: DbAdapt
 
         if (transactionDescriptor !== undefined) {
           const metadata = transactionInvocationMetadata(adapter, transactionDescriptor, args);
+          if (active.context.mode === 'replay') {
+            return invokeReplayedDbMethod(active, value, thisArg, args, metadata);
+          }
+
           return invokeRecordedDbMethod(active, value, thisArg, args, metadata, (result) =>
             transactionOutput(transactionDescriptor, args, result)
           );
