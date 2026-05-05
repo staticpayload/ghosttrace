@@ -1,3 +1,5 @@
+import * as http from 'node:http';
+import * as https from 'node:https';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SpanType, ghost, type Span } from '../../src/index.js';
 
@@ -33,6 +35,113 @@ function fetchUrls(spans: readonly Span[]): readonly string[] {
     }
 
     return [span.input.url];
+  });
+}
+
+function httpSpans(spans: readonly Span[]): readonly Span[] {
+  return spans.filter((span) => span.type === SpanType.Http);
+}
+
+function requireRecord(value: unknown, label: string): Readonly<Record<string, unknown>> {
+  if (!isRecord(value)) {
+    throw new Error(`${label} must be a record`);
+  }
+
+  return value;
+}
+
+function requireString(value: unknown, label: string): string {
+  if (typeof value !== 'string') {
+    throw new Error(`${label} must be a string`);
+  }
+
+  return value;
+}
+
+function readIncomingRequest(request: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk: string) => {
+      body += chunk;
+    });
+    request.once('end', () => resolve(body));
+    request.once('error', reject);
+  });
+}
+
+function listenOnEphemeralPort(server: http.Server): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const onError = (error: Error): void => {
+      server.off('listening', onListening);
+      reject(error);
+    };
+    const onListening = (): void => {
+      server.off('error', onError);
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        reject(new Error('server did not expose a TCP port'));
+        return;
+      }
+
+      resolve(address.port);
+    };
+
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(0, '127.0.0.1');
+  });
+}
+
+function closeServer(server: http.Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error !== undefined) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    });
+  });
+}
+
+interface RequestTextOptions {
+  readonly method?: string;
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly body?: string;
+  readonly timeoutMs?: number;
+}
+
+function requestText(url: string, options: RequestTextOptions = {}): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      url,
+      {
+        method: options.method,
+        headers: options.headers
+      },
+      (response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk: string) => {
+          body += chunk;
+        });
+        response.once('end', () => resolve(body));
+        response.once('error', reject);
+      }
+    );
+
+    request.once('error', reject);
+    if (options.timeoutMs !== undefined) {
+      request.setTimeout(options.timeoutMs, () => {
+        request.destroy(new Error('request timed out'));
+      });
+    }
+    if (options.body !== undefined) {
+      request.write(options.body);
+    }
+    request.end();
   });
 }
 
@@ -99,5 +208,295 @@ describe('HTTP interceptor', () => {
     expect(originalFetch).toHaveBeenCalledTimes(2);
     expect(fetchUrls(firstTrace.spans)).toEqual(['https://example.test/overlap/first']);
     expect(fetchUrls(secondTrace.spans)).toEqual(['https://example.test/overlap/second']);
+  });
+
+  it('captures fetch request and response details while preserving json and blob readers', async () => {
+    const fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({ ok: true }), {
+        status: 201,
+        statusText: 'Created',
+        headers: {
+          'content-type': 'application/json',
+          'x-response': 'yes'
+        }
+      })
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const trace = await ghost.record(
+      'fetch-details',
+      async () => {
+        const jsonResponse = await fetch('https://api.example.test/widgets?kind=all', {
+          method: 'POST',
+          headers: {
+            'x-api-key': 'test-key'
+          },
+          body: 'payload'
+        });
+        const json = (await jsonResponse.json()) as { readonly ok: boolean };
+
+        const blobResponse = await fetch('https://api.example.test/blob');
+        const blob = await blobResponse.blob();
+
+        return {
+          ok: json.ok,
+          blobSize: blob.size
+        };
+      },
+      { interceptors: ['http'] }
+    );
+
+    const spans = httpSpans(trace.spans);
+    expect(spans).toHaveLength(2);
+    expect(spans[0]).toMatchObject({
+      parentId: 'span_0001',
+      name: 'fetch',
+      input: {
+        method: 'POST',
+        url: 'https://api.example.test/widgets?kind=all',
+        headers: {
+          'x-api-key': 'test-key'
+        },
+        body: 'payload'
+      },
+      output: {
+        status: 201,
+        statusText: 'Created',
+        headers: {
+          'content-type': 'application/json',
+          'x-response': 'yes'
+        },
+        body: '{"ok":true}'
+      },
+      error: null
+    });
+    expect(trace.spans[0]?.output).toEqual({
+      ok: true,
+      blobSize: '{"ok":true}'.length
+    });
+  });
+
+  it('captures Request object method URL headers and body', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('accepted', { status: 202 })));
+
+    const trace = await ghost.record(
+      'request-object',
+      async () => {
+        const request = new Request('https://api.example.test/request-object?mode=put', {
+          method: 'PUT',
+          headers: {
+            'x-request-object': 'yes'
+          },
+          body: 'request-body'
+        });
+        const response = await fetch(request);
+        return response.text();
+      },
+      { interceptors: ['http'] }
+    );
+
+    const span = httpSpans(trace.spans)[0];
+    expect(span).toMatchObject({
+      input: {
+        method: 'PUT',
+        url: 'https://api.example.test/request-object?mode=put',
+        headers: {
+          'x-request-object': 'yes'
+        },
+        body: 'request-body'
+      },
+      output: {
+        status: 202,
+        body: 'accepted'
+      },
+      error: null
+    });
+  });
+
+  it('truncates oversized fetch response bodies with explicit size metadata', async () => {
+    const largeBody = 'x'.repeat(10 * 1024 * 1024);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(largeBody, {
+          status: 200,
+          headers: {
+            'content-type': 'text/plain',
+            'content-length': String(largeBody.length)
+          }
+        })
+      )
+    );
+
+    const trace = await ghost.record(
+      'fetch-large-response',
+      async () => {
+        const response = await fetch('https://api.example.test/large');
+        return response.status;
+      },
+      { interceptors: ['http'] }
+    );
+
+    const span = httpSpans(trace.spans)[0];
+    const output = requireRecord(span?.output, 'span.output');
+    const body = requireRecord(output.body, 'span.output.body');
+    const text = requireString(body.text, 'span.output.body.text');
+    expect(body.truncated).toBe(true);
+    expect(body.limitBytes).toBe(1024 * 1024);
+    expect(body.byteLength).toBe(largeBody.length);
+    expect(text.length).toBeLessThan(largeBody.length);
+  });
+
+  it('records fetch network errors, aborts, timeouts, and streaming response bodies', async () => {
+    const encoder = new TextEncoder();
+    const networkError = new TypeError('network down');
+    const abortError = new DOMException('This operation was aborted', 'AbortError');
+    const timeoutError = new DOMException('The operation timed out', 'TimeoutError');
+    const fetchSpy = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(networkError)
+      .mockRejectedValueOnce(abortError)
+      .mockRejectedValueOnce(timeoutError)
+      .mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode('hello '));
+              controller.enqueue(encoder.encode('stream'));
+              controller.close();
+            }
+          })
+        )
+      );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const trace = await ghost.record(
+      'fetch-errors-and-streaming',
+      async () => {
+        for (const url of [
+          'https://api.example.test/network',
+          'https://api.example.test/abort',
+          'https://api.example.test/timeout'
+        ]) {
+          try {
+            await fetch(url);
+          } catch {
+            // Expected: the interceptor should record and rethrow each original error.
+          }
+        }
+
+        const response = await fetch('https://api.example.test/stream');
+        return response.text();
+      },
+      { interceptors: ['http'] }
+    );
+
+    const spans = httpSpans(trace.spans);
+    expect(spans).toHaveLength(4);
+    expect(spans[0]?.error).toMatchObject({ name: 'TypeError', message: 'network down' });
+    expect(spans[1]?.error).toMatchObject({ name: 'AbortError' });
+    expect(spans[2]?.error).toMatchObject({ name: 'TimeoutError' });
+    expect(spans[3]).toMatchObject({
+      output: {
+        body: 'hello stream'
+      },
+      error: null
+    });
+    expect(trace.spans[0]?.output).toBe('hello stream');
+  });
+
+  it('patches and restores node http and https request while capturing request and response details', async () => {
+    const originalHttpRequest = http.request;
+    const originalHttpsRequest = https.request;
+    const server = http.createServer(async (request, response) => {
+      const body = await readIncomingRequest(request);
+      response.writeHead(202, {
+        'content-type': 'text/plain',
+        'x-node-response': 'yes'
+      });
+      response.end(`echo:${body}`);
+    });
+
+    try {
+      const port = await listenOnEphemeralPort(server);
+      const url = `http://127.0.0.1:${port}/node?query=yes`;
+      const trace = await ghost.record(
+        'node-request',
+        async () => {
+          expect(http.request).not.toBe(originalHttpRequest);
+          expect(https.request).not.toBe(originalHttpsRequest);
+          return requestText(url, {
+            method: 'POST',
+            headers: {
+              'x-node-input': 'yes'
+            },
+            body: 'node-body'
+          });
+        },
+        { interceptors: ['http'] }
+      );
+
+      expect(http.request).toBe(originalHttpRequest);
+      expect(https.request).toBe(originalHttpsRequest);
+      expect(trace.spans[0]?.output).toBe('echo:node-body');
+
+      const span = httpSpans(trace.spans)[0];
+      expect(span).toMatchObject({
+        name: 'http.request',
+        input: {
+          method: 'POST',
+          url,
+          headers: {
+            'x-node-input': 'yes'
+          },
+          body: 'node-body'
+        },
+        output: {
+          status: 202,
+          headers: {
+            'content-type': 'text/plain',
+            'x-node-response': 'yes'
+          },
+          body: 'echo:node-body'
+        },
+        error: null
+      });
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it('records node http request timeouts as errored HTTP spans', async () => {
+    const server = http.createServer(() => {
+      // Intentionally leave the request open until the client timeout fires.
+    });
+
+    try {
+      const port = await listenOnEphemeralPort(server);
+      const trace = await ghost.record(
+        'node-request-timeout',
+        async () => {
+          try {
+            await requestText(`http://127.0.0.1:${port}/timeout`, { timeoutMs: 10 });
+          } catch {
+            return 'timed-out';
+          }
+
+          return 'unexpected-success';
+        },
+        { interceptors: ['http'] }
+      );
+
+      const span = httpSpans(trace.spans)[0];
+      expect(trace.spans[0]?.output).toBe('timed-out');
+      expect(span).toMatchObject({
+        name: 'http.request',
+        error: {
+          name: 'TimeoutError'
+        }
+      });
+    } finally {
+      await closeServer(server);
+    }
   });
 });
