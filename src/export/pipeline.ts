@@ -65,7 +65,7 @@ function spanOverlapsRange(span: Span, range: ExportTimeRange | undefined, trace
     return span.startTime >= start && span.startTime <= end;
   }
 
-  return span.endTime > start && span.startTime < end;
+  return span.endTime >= start && span.startTime <= end;
 }
 
 function spanMatchesExportFilter(span: Span, filter: TraceExportFilter | undefined, trace: Trace): boolean {
@@ -137,7 +137,7 @@ function exportTraceContent(trace: Trace, options: ExportTraceOptions, format: T
     htmlOptions.diff = diffResult;
   }
   if (baselineTrace !== undefined) {
-    htmlOptions.baselineTrace = baselineTrace;
+    htmlOptions.baselineTrace = applyExportPipeline(baselineTrace, options);
   }
 
   return exportHtml(trace, htmlOptions);

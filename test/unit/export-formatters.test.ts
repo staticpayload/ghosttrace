@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { Buffer } from 'node:buffer';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  deserialize,
   ExportError,
   SpanType,
   TRACE_FORMAT_VERSION,
@@ -11,6 +13,7 @@ import {
   exportMarkdown,
   exportMermaid,
   exportTrace,
+  type DiffResult,
   type Span,
   type Trace
 } from '../../src/index.js';
@@ -115,6 +118,14 @@ function embeddedViewerData(html: string): unknown {
   return JSON.parse(match.groups.json);
 }
 
+function objectRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Expected a plain object record');
+  }
+
+  return value as Record<string, unknown>;
+}
+
 describe('export formatters', () => {
   it('exports pretty and compact JSON that round-trip to the same trace data', () => {
     const pretty = exportJson(sampleTrace, { mode: 'pretty' });
@@ -123,8 +134,74 @@ describe('export formatters', () => {
     expect(pretty).toContain('\n');
     expect(pretty).toContain('\n  "id": "trace_export_test"');
     expect(compact).not.toContain('\n');
-    expect(JSON.parse(pretty) as Trace).toEqual(sampleTrace);
-    expect(JSON.parse(compact) as Trace).toEqual(sampleTrace);
+    expect(deserialize<Trace>(JSON.parse(pretty))).toEqual(sampleTrace);
+    expect(deserialize<Trace>(JSON.parse(compact))).toEqual(sampleTrace);
+  });
+
+  it('exports JSON through serializer-backed conversion so special values round-trip in pretty and compact modes', () => {
+    const capturedAt = new Date('2026-05-05T12:34:56.789Z');
+    const bytes = Buffer.from('export-payload');
+    const specialTrace: Trace = {
+      ...trace([
+        span({
+          id: 'span_special_0001',
+          parentId: null,
+          type: SpanType.Function,
+          name: 'special payload',
+          startTime: 1,
+          duration: 2,
+          input: {
+            capturedAt,
+            lookup: new Map<string, unknown>([['answer', 42]]),
+            tags: new Set(['json', 'serializer']),
+            bytes,
+            missing: undefined
+          },
+          output: {
+            completedAt: capturedAt,
+            optional: undefined
+          }
+        })
+      ]),
+      metadata: {
+        recordedAt: capturedAt,
+        topLevelMissing: undefined
+      }
+    };
+
+    for (const mode of ['pretty', 'compact'] as const) {
+      const exported = exportJson(specialTrace, { mode });
+      const revivedTrace = deserialize<Trace>(JSON.parse(exported));
+      const [revivedSpan] = revivedTrace.spans;
+
+      if (revivedSpan === undefined) {
+        throw new Error('Expected one revived span');
+      }
+
+      const input = objectRecord(revivedSpan.input);
+      const output = objectRecord(revivedSpan.output);
+
+      expect(revivedTrace.metadata.recordedAt).toBeInstanceOf(Date);
+      expect((revivedTrace.metadata.recordedAt as Date).toISOString()).toBe(capturedAt.toISOString());
+      expect(Object.prototype.hasOwnProperty.call(revivedTrace.metadata, 'topLevelMissing')).toBe(true);
+      expect(revivedTrace.metadata.topLevelMissing).toBeUndefined();
+
+      expect(input.capturedAt).toBeInstanceOf(Date);
+      expect((input.capturedAt as Date).toISOString()).toBe(capturedAt.toISOString());
+      expect(input.lookup).toBeInstanceOf(Map);
+      expect([...(input.lookup as Map<unknown, unknown>).entries()]).toEqual([['answer', 42]]);
+      expect(input.tags).toBeInstanceOf(Set);
+      expect([...(input.tags as Set<unknown>).values()]).toEqual(['json', 'serializer']);
+      expect(Buffer.isBuffer(input.bytes)).toBe(true);
+      expect((input.bytes as Buffer).toString('utf8')).toBe('export-payload');
+      expect(Object.prototype.hasOwnProperty.call(input, 'missing')).toBe(true);
+      expect(input.missing).toBeUndefined();
+
+      expect(output.completedAt).toBeInstanceOf(Date);
+      expect((output.completedAt as Date).toISOString()).toBe(capturedAt.toISOString());
+      expect(Object.prototype.hasOwnProperty.call(output, 'optional')).toBe(true);
+      expect(output.optional).toBeUndefined();
+    }
   });
 
   it('exports Markdown with type icons, timing, parent-child indentation, and summary totals', () => {
@@ -244,6 +321,43 @@ describe('export formatters', () => {
     expect(diffHtml).toContain('diff-severity-breaking');
   });
 
+  it('applies HTML diff filters and transforms to the baseline trace before comparing', async () => {
+    const baselineTrace = trace([
+      httpSpan,
+      timerSpan
+    ]);
+    const currentTrace = trace([
+      {
+        ...httpSpan,
+        name: 'GET /api/orders?phase=current'
+      }
+    ]);
+    const html = await exportTrace(currentTrace, {
+      format: 'html',
+      baselineTrace,
+      filter: {
+        types: [SpanType.Http]
+      },
+      transform: (filteredTrace) => ({
+        ...filteredTrace,
+        spans: filteredTrace.spans.map((selectedSpan) => ({
+          ...selectedSpan,
+          name: 'NORMALIZED HTTP'
+        }))
+      })
+    });
+    const data = embeddedViewerData(html) as { readonly diff: DiffResult | null };
+
+    if (data.diff === null) {
+      throw new Error('Expected computed diff data');
+    }
+
+    expect(data.diff.status).toBe('identical');
+    expect(data.diff.stats.changed).toBe(0);
+    expect(data.diff.stats.removed).toBe(0);
+    expect(data.diff.changes).toEqual([]);
+  });
+
   it('runs the export pipeline filter pass by type and time range', async () => {
     const byType = await exportTrace(sampleTrace, {
       format: 'json',
@@ -267,7 +381,58 @@ describe('export formatters', () => {
     });
     const byTimeRangeTrace = JSON.parse(byTimeRange) as Trace;
 
-    expect(byTimeRangeTrace.spans.map((selectedSpan) => selectedSpan.id)).toEqual(['span_0003']);
+    expect(byTimeRangeTrace.spans.map((selectedSpan) => selectedSpan.id)).toEqual(['span_0002', 'span_0003']);
+  });
+
+  it('includes spans that start or end exactly on time-range filter boundaries', async () => {
+    const endsAtStart = span({
+      id: 'span_ends_at_start',
+      parentId: null,
+      type: SpanType.Function,
+      name: 'ends at lower boundary',
+      startTime: 2,
+      duration: 4
+    });
+    const startsAtEnd = span({
+      id: 'span_starts_at_end',
+      parentId: null,
+      type: SpanType.Function,
+      name: 'starts at upper boundary',
+      startTime: 9,
+      duration: 2
+    });
+    const beforeRange = span({
+      id: 'span_before_range',
+      parentId: null,
+      type: SpanType.Function,
+      name: 'before range',
+      startTime: 1,
+      duration: 4
+    });
+    const afterRange = span({
+      id: 'span_after_range',
+      parentId: null,
+      type: SpanType.Function,
+      name: 'after range',
+      startTime: 10,
+      duration: 2
+    });
+    const boundaryTrace = trace([beforeRange, endsAtStart, startsAtEnd, afterRange]);
+    const exported = await exportTrace(boundaryTrace, {
+      format: 'json',
+      filter: {
+        timeRange: {
+          start: 6,
+          end: 9
+        }
+      }
+    });
+    const filteredTrace = JSON.parse(exported) as Trace;
+
+    expect(filteredTrace.spans.map((selectedSpan) => selectedSpan.id)).toEqual([
+      'span_ends_at_start',
+      'span_starts_at_end'
+    ]);
   });
 
   it('applies transform passes after filtering and before formatting', async () => {

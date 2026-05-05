@@ -1,5 +1,5 @@
 import { type Span, type Trace } from '../core/types.js';
-import { toSerializableTrace } from '../validation/canonical.js';
+import { canonicalJsonStringify, toSerializableTrace } from '../validation/canonical.js';
 import {
   buildSpanTree,
   durationText,
@@ -116,10 +116,10 @@ function renderMermaidFlowchart(trace: Trace): string {
 
 /** Exports a trace as JSON using either two-space pretty output or compact single-line output. */
 export function exportJson<TSpan extends Span>(trace: Trace<TSpan>, options: ExportJsonOptions = {}): string {
-  const serializableTrace = toSerializableTrace(trace);
+  const compactJson = canonicalJsonStringify(toSerializableTrace(trace));
   return normalizeJsonMode(trace, options.mode) === 'pretty'
-    ? `${JSON.stringify(serializableTrace, null, 2)}\n`
-    : JSON.stringify(serializableTrace);
+    ? `${JSON.stringify(JSON.parse(compactJson), null, 2)}\n`
+    : compactJson;
 }
 
 /** Exports a trace as Markdown with a hierarchical call tree and timing summary. */
