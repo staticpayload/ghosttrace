@@ -108,6 +108,15 @@ interface BodyCaptureHandle {
   readonly finalize: () => void;
 }
 
+interface RequestBodyCaptureTask {
+  readonly completion: Promise<unknown>;
+}
+
+interface PreparedLazyRequestInput {
+  readonly details: Record<string, unknown>;
+  readonly bodyCapture?: RequestBodyCaptureTask;
+}
+
 interface MutableReadableStreamMethods {
   getReader: (...args: unknown[]) => unknown;
   cancel?: (reason?: unknown) => Promise<void>;
@@ -268,6 +277,36 @@ function deferredBodyRecord(reportedByteLength?: number): BodyDeferredRecord | P
   return record;
 }
 
+function deferredRequestBodyRecord(reportedByteLength?: number): BodyDeferredRecord | PartialBodyRecord {
+  if (reportedByteLength !== undefined && reportedByteLength > MAX_CAPTURE_BYTES) {
+    return {
+      text: '',
+      truncated: true,
+      byteLength: reportedByteLength,
+      capturedBytes: 0,
+      limitBytes: MAX_CAPTURE_BYTES,
+      reason: 'request body exceeds the capture limit and capture is deferred until the request body is consumed'
+    };
+  }
+
+  const record: {
+    deferred: true;
+    reason: string;
+    byteLength?: number;
+    limitBytes: number;
+  } = {
+    deferred: true,
+    reason: 'request body capture is deferred until the request body is consumed',
+    limitBytes: MAX_CAPTURE_BYTES
+  };
+
+  if (reportedByteLength !== undefined) {
+    record.byteLength = reportedByteLength;
+  }
+
+  return record;
+}
+
 function contentLengthFromHeaders(headers: Headers): number | undefined {
   const contentLength = headers.get('content-length');
   if (contentLength === null) {
@@ -406,6 +445,45 @@ async function captureRequestObjectBody(request: Request): Promise<unknown> {
   }
 }
 
+function requestHasInitBody(init: RequestInit | undefined): boolean {
+  return init !== undefined && 'body' in init;
+}
+
+function lazyRequestObjectInputDetails(request: Request, init: RequestInit | undefined): PreparedLazyRequestInput {
+  const initHeaders = normalizeHeaders(init?.headers);
+  const requestHeaders = headersToRecord(request.headers);
+  const method = init?.method ?? request.method;
+  const reportedByteLength = contentLengthFromHeaders(request.headers);
+  const details: Record<string, unknown> = {
+    method,
+    url: request.url,
+    headers: {
+      ...requestHeaders,
+      ...initHeaders
+    },
+    body: request.body === null || request.bodyUsed ? undefined : deferredRequestBodyRecord(reportedByteLength)
+  };
+
+  if (request.body === null || request.bodyUsed) {
+    return { details };
+  }
+
+  return {
+    details,
+    bodyCapture: {
+      completion: captureRequestObjectBody(request)
+    }
+  };
+}
+
+function prepareLazyRequestObjectInput(input: RequestInfo | URL, init: RequestInit | undefined): PreparedLazyRequestInput | undefined {
+  if (typeof Request === 'undefined' || !(input instanceof Request) || requestHasInitBody(init)) {
+    return undefined;
+  }
+
+  return lazyRequestObjectInputDetails(input, init);
+}
+
 function responseMetadataOutput(response: Response): Record<string, unknown> {
   const output: Record<string, unknown> = {
     status: response.status,
@@ -539,6 +617,23 @@ function completeHttpSpan(
 
 function updateSpanOutput(span: Span, output: unknown): void {
   (span as MutableSpan).output = serialize(output);
+}
+
+function updateSpanInput(span: Span, input: unknown): void {
+  (span as MutableSpan).input = serialize(input);
+}
+
+function installRequestBodyCapture(inputDetails: Record<string, unknown>, spanRef: () => Span, bodyCapture: RequestBodyCaptureTask): void {
+  void bodyCapture.completion.then(
+    (body) => {
+      inputDetails.body = body;
+      updateSpanInput(spanRef(), inputDetails);
+    },
+    (error: unknown) => {
+      inputDetails.body = bodyUnavailable(error);
+      updateSpanInput(spanRef(), inputDetails);
+    }
+  );
 }
 
 function isReadResultRecord(value: unknown): value is ReadableStreamReadResultRecord {
@@ -759,13 +854,20 @@ function installGlobalFetchPatch(): void {
       return fetch(input, init);
     }
 
-    const inputDetails = await fetchInputDetails(input, init);
+    const preparedRequest = prepareLazyRequestObjectInput(input, init);
+    const inputDetails = preparedRequest?.details ?? (await fetchInputDetails(input, init));
     const span = pendingHttpSpan(active.context, 'fetch', inputDetails);
+    let currentSpan = span;
+
+    if (preparedRequest?.bodyCapture !== undefined) {
+      installRequestBodyCapture(inputDetails, () => currentSpan, preparedRequest.bodyCapture);
+    }
 
     try {
       const response = await runWithSpanContext(span, () => fetch(input, init));
       const output = responseMetadataOutput(response);
       const completedSpan = completeHttpSpan(active.context, span, inputDetails, output, null);
+      currentSpan = completedSpan;
       active.session.addSpan(completedSpan);
       try {
         installLazyResponseBodyCapture(response, completedSpan, output);
@@ -777,7 +879,9 @@ function installGlobalFetchPatch(): void {
       }
       return response;
     } catch (error) {
-      active.session.addSpan(completeHttpSpan(active.context, span, inputDetails, undefined, spanErrorFromUnknown(error)));
+      const completedSpan = completeHttpSpan(active.context, span, inputDetails, undefined, spanErrorFromUnknown(error));
+      currentSpan = completedSpan;
+      active.session.addSpan(completedSpan);
       throw error;
     }
   };

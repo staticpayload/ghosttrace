@@ -119,6 +119,10 @@ interface RequestTextOptions {
   readonly timeoutMs?: number;
 }
 
+interface StreamingRequestInit extends RequestInit {
+  readonly duplex: 'half';
+}
+
 function requestText(url: string, options: RequestTextOptions = {}): Promise<string> {
   return new Promise((resolve, reject) => {
     const request = http.request(
@@ -314,6 +318,75 @@ describe('HTTP interceptor', () => {
       output: {
         status: 202,
         body: 'accepted'
+      },
+      error: null
+    });
+  });
+
+  it('dispatches fetch with a streaming Request body before the body closes and still captures the body', async () => {
+    const encoder = new TextEncoder();
+    const controllerReady = createDeferred<ReadableStreamDefaultController<Uint8Array>>();
+    const fetchCalled = createDeferred<void>();
+    const fetchSpy = vi.fn<typeof fetch>(async (input, init) => {
+      fetchCalled.resolve();
+      const request = input instanceof Request ? input : new Request(input, init);
+      const body = await request.text();
+      return new Response(`echo:${body}`, { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+    let dispatchedBeforeBodyClosed = false;
+
+    const trace = await ghost.record(
+      'streaming-request-body-lazy',
+      async () => {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('first'));
+            controllerReady.resolve(controller);
+          }
+        });
+        const requestInit: StreamingRequestInit = {
+          method: 'POST',
+          headers: {
+            'content-type': 'text/plain'
+          },
+          body: stream,
+          duplex: 'half'
+        };
+        const request = new Request('https://api.example.test/streaming-request-body', requestInit);
+        const responsePromise = fetch(request);
+        const dispatchResult = await Promise.race([
+          fetchCalled.promise.then(() => 'called' as const),
+          delay(25).then(() => 'timeout' as const)
+        ]);
+
+        dispatchedBeforeBodyClosed = dispatchResult === 'called';
+        const controller = await controllerReady.promise;
+        controller.enqueue(encoder.encode('second'));
+        controller.close();
+
+        const response = await responsePromise;
+        return response.text();
+      },
+      { interceptors: ['http'] }
+    );
+
+    expect(dispatchedBeforeBodyClosed).toBe(true);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(trace.spans[0]?.output).toBe('echo:firstsecond');
+    const span = httpSpans(trace.spans)[0];
+    expect(span).toMatchObject({
+      input: {
+        method: 'POST',
+        url: 'https://api.example.test/streaming-request-body',
+        headers: {
+          'content-type': 'text/plain'
+        },
+        body: 'firstsecond'
+      },
+      output: {
+        status: 200,
+        body: 'echo:firstsecond'
       },
       error: null
     });
