@@ -1,4 +1,18 @@
-import { GhostTraceError } from './core/errors.js';
+import {
+  AdapterError,
+  ExportError,
+  GhostTraceError,
+  RecordingError,
+  RedactionError,
+  ReplayExhaustedError,
+  ReplayMismatchError,
+  SerializationError,
+  TraceValidationError,
+  TraceVersionError
+} from './core/errors.js';
+import { createTraceContext, getTraceContext, requireTraceContext, runWithSpanContext, runWithTraceContext } from './core/context.js';
+import { createVirtualClock } from './core/clock.js';
+import { createIdGenerator } from './core/id.js';
 import { deserialize, serialize, stringifySerialized, writeSerializedJson } from './core/serializer.js';
 import {
   TRACE_FORMAT_VERSION,
@@ -16,8 +30,31 @@ import {
 import { VERSION } from './version.js';
 
 export { VERSION } from './version.js';
-export { GhostTraceError } from './core/errors.js';
+export {
+  AdapterError,
+  ExportError,
+  GhostTraceError,
+  RecordingError,
+  RedactionError,
+  ReplayExhaustedError,
+  ReplayMismatchError,
+  SerializationError,
+  TraceValidationError,
+  TraceVersionError
+} from './core/errors.js';
 export type { GhostTraceErrorOptions } from './core/errors.js';
+export {
+  createTraceContext,
+  getTraceContext,
+  requireTraceContext,
+  runWithSpanContext,
+  runWithTraceContext,
+  type CreateTraceContextOptions,
+  type TraceContext,
+  type TraceContextMode
+} from './core/context.js';
+export { createVirtualClock, type VirtualClock, type VirtualClockOptions } from './core/clock.js';
+export { createIdGenerator, type DeterministicIdGenerator, type IdGeneratorOptions } from './core/id.js';
 export {
   deserialize,
   serialize,
@@ -160,6 +197,13 @@ export const ghost = {
   createTrace,
   defineConfig,
   createTracer,
+  createTraceContext,
+  getTraceContext,
+  requireTraceContext,
+  runWithSpanContext,
+  runWithTraceContext,
+  createVirtualClock,
+  createIdGenerator,
   record,
   replay,
   serialize,
@@ -167,5 +211,15 @@ export const ghost = {
   stringifySerialized,
   writeSerializedJson,
   wrap,
-  wrapModule
+  wrapModule,
+  GhostTraceError,
+  RecordingError,
+  ReplayMismatchError,
+  ReplayExhaustedError,
+  TraceValidationError,
+  TraceVersionError,
+  RedactionError,
+  AdapterError,
+  SerializationError,
+  ExportError
 } as const;
