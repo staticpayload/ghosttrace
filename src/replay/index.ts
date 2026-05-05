@@ -8,7 +8,14 @@ import {
   type Trace,
   type TraceableFunction
 } from '../core/types.js';
-import { envInterceptor, randomInterceptor, timerInterceptor, type Interceptor, type Teardown } from '../interceptors/index.js';
+import {
+  envInterceptor,
+  fsInterceptor,
+  randomInterceptor,
+  timerInterceptor,
+  type Interceptor,
+  type Teardown
+} from '../interceptors/index.js';
 import { createReplayStore } from './store.js';
 
 interface ReplayInterceptorEntry {
@@ -19,7 +26,8 @@ interface ReplayInterceptorEntry {
 const replayInterceptors: readonly ReplayInterceptorEntry[] = [
   { type: SpanType.Timer, interceptor: timerInterceptor },
   { type: SpanType.Random, interceptor: randomInterceptor },
-  { type: SpanType.Env, interceptor: envInterceptor }
+  { type: SpanType.Env, interceptor: envInterceptor },
+  { type: SpanType.Fs, interceptor: fsInterceptor }
 ];
 
 function notImplemented(featureName: string): GhostTraceError {
@@ -61,7 +69,7 @@ function teardownReplayInterceptors(teardowns: readonly Teardown[]): void {
   }
 }
 
-/** Replays deterministic timer, random, and env spans against a trace object. */
+/** Replays deterministic timer, random, env, and filesystem spans against a trace object. */
 export async function replay<TOutput, TSpan extends Span = Span>(
   trace: Trace<TSpan> | string,
   fn: TraceableFunction<TOutput>,
