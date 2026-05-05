@@ -76,6 +76,34 @@ describe('serializer', () => {
     expect(roundTripSet.has('stable')).toBe(true);
   });
 
+  it('preserves user-owned __type properties as plain object data', () => {
+    const collidingObject = {
+      __type: 'Date',
+      value: 'not-a-date',
+      nested: {
+        __type: 'Buffer',
+        encoding: 'utf8',
+        value: 'not-buffer-data'
+      },
+      items: [
+        { __type: 'SparseHole' },
+        { __type: 'Map', entries: 'not-map-entries' }
+      ]
+    };
+
+    expect(deserialize(serialize(collidingObject))).toEqual(collidingObject);
+  });
+
+  it('does not deserialize unbranded tag-shaped objects as serializer markers', () => {
+    const tagShapedObject = {
+      __type: 'Buffer',
+      encoding: 'base64',
+      value: 'Z2hvc3R0cmFjZQ=='
+    };
+
+    expect(deserialize(tagShapedObject)).toEqual(tagShapedObject);
+  });
+
   it('replaces functions with serializable placeholders', () => {
     function namedPlaceholder(): void {
       return undefined;
@@ -86,6 +114,7 @@ describe('serializer', () => {
     expect(serialized).toEqual({
       fn: {
         __type: 'Function',
+        __ghosttrace_tag: true,
         name: 'namedPlaceholder'
       }
     });
@@ -101,9 +130,9 @@ describe('serializer', () => {
 
     expect(serialized).toEqual({
       name: 'root',
-      self: { __type: 'CircularRef', path: '$' },
+      self: { __type: 'CircularRef', __ghosttrace_tag: true, path: '$' },
       child: {
-        parent: { __type: 'CircularRef', path: '$' }
+        parent: { __type: 'CircularRef', __ghosttrace_tag: true, path: '$' }
       }
     });
   });
@@ -135,6 +164,7 @@ describe('serializer', () => {
           level: 3,
           next: {
             __type: 'Truncated',
+            __ghosttrace_tag: true,
             maxDepth: 3,
             path: '$.next.next.next'
           }

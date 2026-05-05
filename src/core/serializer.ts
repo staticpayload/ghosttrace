@@ -54,6 +54,7 @@ interface SerializeContext {
 }
 
 const TYPE_KEY = '__type';
+const MARKER_KEY = '__ghosttrace_tag';
 const DEFAULT_MAX_DEPTH = 20;
 const DEFAULT_CHUNK_SIZE = 64 * 1024;
 const SIMPLE_PATH_SEGMENT = /^[A-Za-z_$][\w$]*$/u;
@@ -94,6 +95,7 @@ function normalizeChunkSize(chunkSize: number | undefined): number {
 function marker(type: MarkerType, properties: Record<string, SerializedJsonValue> = {}): SerializedJsonObject {
   return {
     [TYPE_KEY]: type,
+    [MARKER_KEY]: true,
     ...properties
   };
 }
@@ -336,7 +338,7 @@ function isArrayValue(value: SerializedJsonValue): value is readonly SerializedJ
 }
 
 function isMarker(value: SerializedJsonValue, type: MarkerType): boolean {
-  return isObjectValue(value) && value[TYPE_KEY] === type;
+  return isObjectValue(value) && value[MARKER_KEY] === true && value[TYPE_KEY] === type;
 }
 
 function deserializeNumber(value: SerializedJsonObject): number {
@@ -467,6 +469,18 @@ function deserializePlainObject(value: SerializedJsonObject): Record<string, unk
   return deserialized;
 }
 
+function deserializeMarkerAsPlainObject(value: SerializedJsonObject): Record<string, unknown> {
+  const deserialized: Record<string, unknown> = {};
+
+  for (const key of Object.keys(value)) {
+    if (key !== MARKER_KEY) {
+      deserialized[key] = deserializeValue(value[key] as SerializedJsonValue);
+    }
+  }
+
+  return deserialized;
+}
+
 function deserializeMarker(value: SerializedJsonObject, type: string): unknown {
   switch (type) {
     case 'Undefined':
@@ -504,9 +518,9 @@ function deserializeMarker(value: SerializedJsonObject, type: string): unknown {
     case 'Truncated':
     case 'Unserializable':
     case 'SparseHole':
-      return deserializePlainObject(value);
+      return deserializeMarkerAsPlainObject(value);
     default:
-      return deserializePlainObject(value);
+      return deserializeMarkerAsPlainObject(value);
   }
 }
 
@@ -520,7 +534,7 @@ function deserializeValue(value: SerializedJsonValue): unknown {
   }
 
   const type = getStringProperty(value, TYPE_KEY);
-  if (type !== undefined) {
+  if (type !== undefined && value[MARKER_KEY] === true) {
     return deserializeMarker(value, type);
   }
 
@@ -634,7 +648,7 @@ function* jsonChunksForSerializedMarker(
 }
 
 function* jsonChunksForArray(value: readonly unknown[], context: SerializeContext, path: string, depth: number): Generator<string> {
-  yield '{"__type":"Array","length":';
+  yield '{"__type":"Array","__ghosttrace_tag":true,"length":';
   yield String(value.length);
   yield ',"items":[';
   for (let index = 0; index < value.length; index += 1) {
@@ -652,7 +666,7 @@ function* jsonChunksForArray(value: readonly unknown[], context: SerializeContex
 }
 
 function* jsonChunksForMap(value: Map<unknown, unknown>, context: SerializeContext, path: string, depth: number): Generator<string> {
-  yield '{"__type":"Map","entries":[';
+  yield '{"__type":"Map","__ghosttrace_tag":true,"entries":[';
   let index = 0;
   for (const [entryKey, entryValue] of value) {
     if (index > 0) {
@@ -669,7 +683,7 @@ function* jsonChunksForMap(value: Map<unknown, unknown>, context: SerializeConte
 }
 
 function* jsonChunksForSet(value: Set<unknown>, context: SerializeContext, path: string, depth: number): Generator<string> {
-  yield '{"__type":"Set","values":[';
+  yield '{"__type":"Set","__ghosttrace_tag":true,"values":[';
   let index = 0;
   for (const item of value) {
     if (index > 0) {
