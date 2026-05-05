@@ -85,6 +85,48 @@ describe('CLI init and record commands', () => {
     await expect(readFile(configPath, 'utf8')).resolves.toBe(firstConfig);
   }, cliTestTimeoutMs);
 
+  it('does not detect Vitest from a plain Vite config file alone', async () => {
+    const root = await tempRoot();
+    await writeFile(
+      join(root, 'package.json'),
+      JSON.stringify({ devDependencies: { vite: '^7.0.0' } }),
+      'utf8'
+    );
+    await writeFile(join(root, 'vite.config.ts'), 'export default {};', 'utf8');
+
+    const result = runGhost(root, ['init']);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('Detected framework: node');
+
+    const config = await readFile(join(root, 'ghosttrace.config.ts'), 'utf8');
+    expect(config).toContain("framework: 'node'");
+    expect(config).not.toContain("framework: 'vitest'");
+  }, cliTestTimeoutMs);
+
+  it('leaves an existing ghosttrace.config.mjs config unchanged during init', async () => {
+    const root = await tempRoot();
+    const configPath = join(root, 'ghosttrace.config.mjs');
+    const existingConfig = [
+      "import { defineConfig } from 'ghosttrace';",
+      '',
+      'export default defineConfig({',
+      "  traceDir: 'existing-traces',",
+      '  metadata: { existing: true }',
+      '});',
+      ''
+    ].join('\n');
+    await writeFile(configPath, existingConfig, 'utf8');
+
+    const result = runGhost(root, ['init']);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('ghosttrace.config.mjs already exists');
+    await expect(readFile(configPath, 'utf8')).resolves.toBe(existingConfig);
+    expect(existsSync(join(root, 'ghosttrace.config.ts'))).toBe(false);
+    expect(existsSync(join(root, '__ghosttraces__'))).toBe(true);
+  }, cliTestTimeoutMs);
+
   it('records a TypeScript module export with args, name, output, and interceptor options', async () => {
     const root = await tempRoot();
     const modulePath = join(root, 'math.ts');

@@ -46,20 +46,17 @@ const DEFAULT_TRACE_DIRECTORY = '__ghosttraces__';
 const CONFIG_FILE_NAME = 'ghosttrace.config.ts';
 const CONFIG_FILE_NAMES = [
   CONFIG_FILE_NAME,
-  'ghosttrace.config.mts',
   'ghosttrace.config.js',
   'ghosttrace.config.mjs',
-  'ghosttrace.config.cjs'
+  'ghosttrace.config.cjs',
+  'ghosttrace.config.mts'
 ] as const;
 const VITEST_CONFIG_FILES = [
   'vitest.config.ts',
-  'vitest.config.mts',
   'vitest.config.js',
   'vitest.config.mjs',
-  'vite.config.ts',
-  'vite.config.mts',
-  'vite.config.js',
-  'vite.config.mjs'
+  'vitest.config.cjs',
+  'vitest.config.mts'
 ] as const;
 const JEST_CONFIG_FILES = [
   'jest.config.ts',
@@ -331,20 +328,37 @@ function hasPackageDependency(packageJson: PackageJsonLike, dependencyName: stri
   return DEPENDENCY_FIELDS.some((field): boolean => packageJson[field]?.[dependencyName] !== undefined);
 }
 
-async function hasAnyConfigFile(cwd: string, fileNames: readonly string[]): Promise<boolean> {
+function hasVitestDependency(packageJson: PackageJsonLike): boolean {
+  return DEPENDENCY_FIELDS.some((field): boolean => {
+    const dependencies = packageJson[field];
+    if (dependencies === undefined) {
+      return false;
+    }
+
+    return Object.keys(dependencies).some((dependencyName): boolean => (
+      dependencyName === 'vitest' || dependencyName.startsWith('@vitest/')
+    ));
+  });
+}
+
+async function findConfigFileName(cwd: string, fileNames: readonly string[]): Promise<string | undefined> {
   for (const fileName of fileNames) {
     if (await pathExists(join(cwd, fileName))) {
-      return true;
+      return fileName;
     }
   }
 
-  return false;
+  return undefined;
+}
+
+async function hasAnyConfigFile(cwd: string, fileNames: readonly string[]): Promise<boolean> {
+  return (await findConfigFileName(cwd, fileNames)) !== undefined;
 }
 
 async function detectFramework(cwd: string): Promise<DetectedFramework> {
   const packageJson = packageJsonLike(await readJsonObject(join(cwd, 'package.json')));
 
-  if (hasPackageDependency(packageJson, 'vitest') || (await hasAnyConfigFile(cwd, VITEST_CONFIG_FILES))) {
+  if (hasVitestDependency(packageJson) || (await hasAnyConfigFile(cwd, VITEST_CONFIG_FILES))) {
     return 'vitest';
   }
 
@@ -374,11 +388,12 @@ async function runInitCommand(cwd: string): Promise<void> {
   const framework = await detectFramework(cwd);
   const traceDirectory = join(cwd, DEFAULT_TRACE_DIRECTORY);
   const configPath = join(cwd, CONFIG_FILE_NAME);
+  const existingConfigFileName = await findConfigFileName(cwd, CONFIG_FILE_NAMES);
 
   await mkdir(traceDirectory, { recursive: true });
 
-  if (await pathExists(configPath)) {
-    console.log(pc.yellow(`${CONFIG_FILE_NAME} already exists; leaving it unchanged.`));
+  if (existingConfigFileName !== undefined) {
+    console.log(pc.yellow(`${existingConfigFileName} already exists; leaving it unchanged.`));
   } else {
     await writeFile(configPath, configFileContents(framework), { encoding: 'utf8', flag: 'wx' });
     console.log(pc.green(`Created ${CONFIG_FILE_NAME}`));
