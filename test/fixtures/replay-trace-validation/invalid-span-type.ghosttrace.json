@@ -1,0 +1,37 @@
+{
+  "id": "trace_invalid_span_type",
+  "name": "invalid span type",
+  "version": "1.0.0",
+  "startTime": 0,
+  "endTime": 1,
+  "duration": 1,
+  "spans": [
+    {
+      "id": "span_0001",
+      "parentId": null,
+      "type": "websocket",
+      "name": "fetch",
+      "startTime": 0,
+      "endTime": 1,
+      "duration": 1,
+      "input": {
+        "method": "GET",
+        "url": "https://api.example.test/corrupt",
+        "headers": {},
+        "body": {
+          "__type": "Undefined",
+          "__ghosttrace_tag": true
+        }
+      },
+      "output": {
+        "status": 200,
+        "headers": {},
+        "body": "ok"
+      },
+      "children": [],
+      "error": null,
+      "metadata": {}
+    }
+  ],
+  "metadata": {}
+}

@@ -1,0 +1,40 @@
+{
+  "id": "trace_valid_http_fixture",
+  "name": "valid http fixture",
+  "version": "1.0.0",
+  "startTime": 0,
+  "endTime": 1,
+  "duration": 1,
+  "spans": [
+    {
+      "id": "span_0001",
+      "parentId": null,
+      "type": "http",
+      "name": "fetch",
+      "startTime": 0,
+      "endTime": 1,
+      "duration": 1,
+      "input": {
+        "method": "GET",
+        "url": "https://api.example.test/valid-fixture",
+        "headers": {},
+        "body": {
+          "__type": "Undefined",
+          "__ghosttrace_tag": true
+        }
+      },
+      "output": {
+        "status": 200,
+        "statusText": "OK",
+        "headers": {
+          "content-type": "text/plain;charset=UTF-8"
+        },
+        "body": "fixture-body"
+      },
+      "children": [],
+      "error": null,
+      "metadata": {}
+    }
+  ],
+  "metadata": {}
+}

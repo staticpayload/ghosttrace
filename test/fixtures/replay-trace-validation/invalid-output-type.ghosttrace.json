@@ -1,0 +1,39 @@
+{
+  "id": "trace_invalid_output_type",
+  "name": "invalid output type",
+  "version": "1.0.0",
+  "startTime": 0,
+  "endTime": 1,
+  "duration": 1,
+  "spans": [
+    {
+      "id": "span_0001",
+      "parentId": null,
+      "type": "db",
+      "name": "query",
+      "startTime": 0,
+      "endTime": 1,
+      "duration": 1,
+      "input": {
+        "operation": "query",
+        "query": "select 1",
+        "params": []
+      },
+      "output": {
+        "type": "settled",
+        "result": [
+          {
+            "value": 1
+          }
+        ],
+        "rowCount": 1
+      },
+      "children": [],
+      "error": null,
+      "metadata": {
+        "adapter": "fixture"
+      }
+    }
+  ],
+  "metadata": {}
+}

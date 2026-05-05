@@ -60,6 +60,37 @@ function isNodeError(value: unknown): value is NodeJS.ErrnoException {
   return value instanceof Error;
 }
 
+interface TraceValidationIssue {
+  readonly path: string;
+  readonly message: string;
+}
+
+interface SpanReference {
+  readonly path: string;
+  readonly id?: string;
+  readonly parentId?: string | null;
+}
+
+const VALID_SPAN_TYPE_VALUES: readonly string[] = Object.values(SpanType);
+const VALID_SPAN_TYPE_SET: ReadonlySet<string> = new Set(VALID_SPAN_TYPE_VALUES);
+const VALID_OUTPUT_TYPE_VALUES = ['resolve', 'reject', 'return', 'throw'] as const;
+const VALID_OUTPUT_TYPE_SET: ReadonlySet<string> = new Set(VALID_OUTPUT_TYPE_VALUES);
+const OUTPUT_TYPE_REQUIRED_SPAN_TYPES: ReadonlySet<string> = new Set([SpanType.Db, SpanType.Queue]);
+const REQUIRED_SPAN_FIELDS = [
+  'id',
+  'parentId',
+  'type',
+  'name',
+  'startTime',
+  'endTime',
+  'duration',
+  'input',
+  'output',
+  'children',
+  'error',
+  'metadata'
+] as const;
+
 function traceShapeError(filePath: string, reason: string, context: Readonly<Record<string, unknown>> = {}): TraceValidationError {
   return new TraceValidationError(`Invalid replay trace file ${filePath}: ${reason}`, {
     code: 'GHOSTTRACE_REPLAY_TRACE_INVALID',
@@ -71,49 +102,294 @@ function traceShapeError(filePath: string, reason: string, context: Readonly<Rec
   });
 }
 
+function traceShapeIssuesError(filePath: string, issues: readonly TraceValidationIssue[]): TraceValidationError {
+  const reason = `${issues.length} validation error${issues.length === 1 ? '' : 's'}`;
+
+  return traceShapeError(filePath, `${reason}: ${issues.map((issue) => issue.message).join('; ')}`, {
+    validationErrors: issues.map((issue) => ({
+      path: issue.path,
+      message: issue.message
+    }))
+  });
+}
+
+function hasOwnProperty(value: Readonly<Record<string, unknown>>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function addValidationIssue(issues: TraceValidationIssue[], path: string, message: string): void {
+  issues.push({ path, message });
+}
+
+function requireField(
+  record: Readonly<Record<string, unknown>>,
+  path: string,
+  field: string,
+  issues: TraceValidationIssue[]
+): boolean {
+  if (hasOwnProperty(record, field)) {
+    return true;
+  }
+
+  addValidationIssue(issues, `${path}.${field}`, `${path}.${field} is required`);
+  return false;
+}
+
+function validateStringField(
+  record: Readonly<Record<string, unknown>>,
+  path: string,
+  field: string,
+  issues: TraceValidationIssue[],
+  options: { readonly nonEmpty?: boolean } = {}
+): void {
+  if (!hasOwnProperty(record, field)) {
+    return;
+  }
+
+  const value = record[field];
+  if (typeof value !== 'string' || (options.nonEmpty === true && value.length === 0)) {
+    addValidationIssue(
+      issues,
+      `${path}.${field}`,
+      `${path}.${field} must be ${options.nonEmpty === true ? 'a non-empty string' : 'a string'}`
+    );
+  }
+}
+
+function validateNumberField(
+  record: Readonly<Record<string, unknown>>,
+  path: string,
+  field: string,
+  issues: TraceValidationIssue[]
+): void {
+  if (!hasOwnProperty(record, field)) {
+    return;
+  }
+
+  const value = record[field];
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    addValidationIssue(issues, `${path}.${field}`, `${path}.${field} must be a finite number`);
+  }
+}
+
+function validateRecordField(
+  record: Readonly<Record<string, unknown>>,
+  path: string,
+  field: string,
+  issues: TraceValidationIssue[]
+): void {
+  if (!hasOwnProperty(record, field)) {
+    return;
+  }
+
+  if (!isRecord(record[field])) {
+    addValidationIssue(issues, `${path}.${field}`, `${path}.${field} must be an object`);
+  }
+}
+
+function validateParentIdField(
+  span: Readonly<Record<string, unknown>>,
+  path: string,
+  issues: TraceValidationIssue[]
+): void {
+  if (!hasOwnProperty(span, 'parentId')) {
+    return;
+  }
+
+  const parentId = span.parentId;
+  if (parentId !== null && typeof parentId !== 'string') {
+    addValidationIssue(issues, `${path}.parentId`, `${path}.parentId must be a string or null`);
+  }
+}
+
+function validateSpanTypeField(
+  span: Readonly<Record<string, unknown>>,
+  path: string,
+  issues: TraceValidationIssue[]
+): void {
+  if (!hasOwnProperty(span, 'type')) {
+    return;
+  }
+
+  const spanType = span.type;
+  if (typeof spanType !== 'string') {
+    addValidationIssue(issues, `${path}.type`, `${path}.type must be a string`);
+    return;
+  }
+  if (!VALID_SPAN_TYPE_SET.has(spanType)) {
+    addValidationIssue(
+      issues,
+      `${path}.type`,
+      `${path}.type must be one of: ${VALID_SPAN_TYPE_VALUES.join(', ')}`
+    );
+  }
+}
+
+function validateChildrenField(
+  span: Readonly<Record<string, unknown>>,
+  path: string,
+  issues: TraceValidationIssue[],
+  references: SpanReference[]
+): void {
+  if (!hasOwnProperty(span, 'children')) {
+    return;
+  }
+
+  const children = span.children;
+  if (!Array.isArray(children)) {
+    addValidationIssue(issues, `${path}.children`, `${path}.children must be an array`);
+    return;
+  }
+
+  for (const [index, child] of children.entries()) {
+    validateSpanShape(child, `${path}.children[${index}]`, issues, references);
+  }
+}
+
+function validateErrorField(
+  span: Readonly<Record<string, unknown>>,
+  path: string,
+  issues: TraceValidationIssue[]
+): void {
+  if (!hasOwnProperty(span, 'error')) {
+    return;
+  }
+
+  const error = span.error;
+  if (error !== null && !isRecord(error)) {
+    addValidationIssue(issues, `${path}.error`, `${path}.error must be an object or null`);
+  }
+}
+
+function validateOutputTypeField(
+  span: Readonly<Record<string, unknown>>,
+  path: string,
+  issues: TraceValidationIssue[]
+): void {
+  if (!hasOwnProperty(span, 'output') || typeof span.type !== 'string') {
+    return;
+  }
+  if (!OUTPUT_TYPE_REQUIRED_SPAN_TYPES.has(span.type)) {
+    return;
+  }
+
+  const output = span.output;
+  if (!isRecord(output)) {
+    addValidationIssue(issues, `${path}.output`, `${path}.output must be an object with a replay outcome type`);
+    return;
+  }
+  if (!hasOwnProperty(output, 'type')) {
+    addValidationIssue(issues, `${path}.output.type`, `${path}.output.type is required`);
+    return;
+  }
+  if (typeof output.type !== 'string' || !VALID_OUTPUT_TYPE_SET.has(output.type)) {
+    addValidationIssue(
+      issues,
+      `${path}.output.type`,
+      `${path}.output.type must be one of: ${VALID_OUTPUT_TYPE_VALUES.join(', ')}`
+    );
+  }
+}
+
+function spanReference(span: Readonly<Record<string, unknown>>, path: string): SpanReference {
+  const reference: { path: string; id?: string; parentId?: string | null } = { path };
+
+  if (typeof span.id === 'string' && span.id.length > 0) {
+    reference.id = span.id;
+  }
+  if (span.parentId === null || typeof span.parentId === 'string') {
+    reference.parentId = span.parentId;
+  }
+
+  return reference;
+}
+
+function validateSpanShape(
+  value: unknown,
+  path: string,
+  issues: TraceValidationIssue[],
+  references: SpanReference[]
+): void {
+  if (!isRecord(value)) {
+    addValidationIssue(issues, path, `${path} must be an object`);
+    return;
+  }
+
+  for (const field of REQUIRED_SPAN_FIELDS) {
+    requireField(value, path, field, issues);
+  }
+
+  validateStringField(value, path, 'id', issues, { nonEmpty: true });
+  validateParentIdField(value, path, issues);
+  validateSpanTypeField(value, path, issues);
+  validateStringField(value, path, 'name', issues);
+  validateNumberField(value, path, 'startTime', issues);
+  validateNumberField(value, path, 'endTime', issues);
+  validateNumberField(value, path, 'duration', issues);
+  validateOutputTypeField(value, path, issues);
+  validateChildrenField(value, path, issues, references);
+  validateErrorField(value, path, issues);
+  validateRecordField(value, path, 'metadata', issues);
+  references.push(spanReference(value, path));
+}
+
+function validateParentReferences(references: readonly SpanReference[], issues: TraceValidationIssue[]): void {
+  const spanIds = new Set(references.flatMap((reference) => (reference.id === undefined ? [] : [reference.id])));
+  const reportedReferences = new Set<string>();
+
+  for (const reference of references) {
+    if (typeof reference.parentId !== 'string' || spanIds.has(reference.parentId)) {
+      continue;
+    }
+
+    const reportKey = `${reference.path}:${reference.parentId}`;
+    if (reportedReferences.has(reportKey)) {
+      continue;
+    }
+
+    reportedReferences.add(reportKey);
+    addValidationIssue(
+      issues,
+      `${reference.path}.parentId`,
+      `${reference.path}.parentId references missing span "${reference.parentId}"`
+    );
+  }
+}
+
 function assertTraceShape<TSpan extends Span>(value: unknown, filePath: string): asserts value is Trace<TSpan> {
+  const issues: TraceValidationIssue[] = [];
+  const references: SpanReference[] = [];
+
   if (!isRecord(value)) {
     throw traceShapeError(filePath, 'trace JSON must contain an object');
   }
-  if (typeof value.id !== 'string' || value.id.length === 0) {
-    throw traceShapeError(filePath, 'trace.id must be a non-empty string');
-  }
-  if (typeof value.name !== 'string') {
-    throw traceShapeError(filePath, 'trace.name must be a string');
-  }
-  if (typeof value.version !== 'string') {
-    throw traceShapeError(filePath, 'trace.version must be a string');
-  }
-  if (typeof value.startTime !== 'number' || typeof value.endTime !== 'number' || typeof value.duration !== 'number') {
-    throw traceShapeError(filePath, 'trace timing fields must be numbers');
-  }
-  if (!Array.isArray(value.spans)) {
-    throw traceShapeError(filePath, 'trace.spans must be an array');
-  }
-  if (!isRecord(value.metadata)) {
-    throw traceShapeError(filePath, 'trace.metadata must be an object');
+
+  for (const field of ['id', 'name', 'version', 'startTime', 'endTime', 'duration', 'spans', 'metadata']) {
+    requireField(value, 'trace', field, issues);
   }
 
-  for (const [index, span] of value.spans.entries()) {
-    if (!isRecord(span)) {
-      throw traceShapeError(filePath, 'trace.spans entries must be objects', { index });
+  validateStringField(value, 'trace', 'id', issues, { nonEmpty: true });
+  validateStringField(value, 'trace', 'name', issues);
+  validateStringField(value, 'trace', 'version', issues);
+  validateNumberField(value, 'trace', 'startTime', issues);
+  validateNumberField(value, 'trace', 'endTime', issues);
+  validateNumberField(value, 'trace', 'duration', issues);
+
+  if (hasOwnProperty(value, 'spans')) {
+    if (!Array.isArray(value.spans)) {
+      addValidationIssue(issues, 'trace.spans', 'trace.spans must be an array');
+    } else {
+      for (const [index, span] of value.spans.entries()) {
+        validateSpanShape(span, `trace.spans[${index}]`, issues, references);
+      }
     }
-    if (typeof span.id !== 'string' || typeof span.name !== 'string' || typeof span.type !== 'string') {
-      throw traceShapeError(filePath, 'trace span id, name, and type must be strings', { index });
-    }
-    if (
-      typeof span.startTime !== 'number' ||
-      typeof span.endTime !== 'number' ||
-      typeof span.duration !== 'number'
-    ) {
-      throw traceShapeError(filePath, 'trace span timing fields must be numbers', { index });
-    }
-    if (!Array.isArray(span.children)) {
-      throw traceShapeError(filePath, 'trace span children must be an array', { index });
-    }
-    if (!isRecord(span.metadata)) {
-      throw traceShapeError(filePath, 'trace span metadata must be an object', { index });
-    }
+  }
+
+  validateRecordField(value, 'trace', 'metadata', issues);
+  validateParentReferences(references, issues);
+
+  if (issues.length > 0) {
+    throw traceShapeIssuesError(filePath, issues);
   }
 }
 
@@ -267,6 +543,9 @@ export async function replay<TOutput, TSpan extends Span = Span>(
   options: ReplayOptions = {}
 ): Promise<ReplayResult<Awaited<TOutput>, TSpan>> {
   const trace = typeof traceInput === 'string' ? await loadReplayTrace<TSpan>(traceInput) : traceInput;
+  if (typeof traceInput !== 'string') {
+    assertTraceShape<TSpan>(trace, '<trace object>');
+  }
   const timeout = normalizeReplayTimeout(options.timeout);
 
   const replayStore = createReplayStore(trace, options);

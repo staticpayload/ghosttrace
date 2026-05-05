@@ -1,0 +1,37 @@
+{
+  "id": "trace_dangling_parent_id",
+  "name": "dangling parent id",
+  "version": "1.0.0",
+  "startTime": 0,
+  "endTime": 1,
+  "duration": 1,
+  "spans": [
+    {
+      "id": "span_0001",
+      "parentId": "span_missing",
+      "type": "http",
+      "name": "fetch",
+      "startTime": 0,
+      "endTime": 1,
+      "duration": 1,
+      "input": {
+        "method": "GET",
+        "url": "https://api.example.test/dangling",
+        "headers": {},
+        "body": {
+          "__type": "Undefined",
+          "__ghosttrace_tag": true
+        }
+      },
+      "output": {
+        "status": 200,
+        "headers": {},
+        "body": "ok"
+      },
+      "children": [],
+      "error": null,
+      "metadata": {}
+    }
+  ],
+  "metadata": {}
+}

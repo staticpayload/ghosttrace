@@ -1,0 +1,22 @@
+{
+  "id": "trace_missing_required_fields",
+  "name": "missing required fields",
+  "version": "1.0.0",
+  "startTime": 0,
+  "endTime": 1,
+  "duration": 1,
+  "spans": [
+    {
+      "id": "span_0001",
+      "parentId": null,
+      "type": "http",
+      "startTime": 0,
+      "endTime": 1,
+      "duration": 1,
+      "children": [],
+      "error": null,
+      "metadata": {}
+    }
+  ],
+  "metadata": {}
+}
