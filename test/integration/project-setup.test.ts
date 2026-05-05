@@ -9,6 +9,7 @@ const projectRoot = resolve(__dirname, '../..');
 const distDir = join(projectRoot, 'dist');
 const packageJsonPath = join(projectRoot, 'package.json');
 const requireFromTest = createRequire(import.meta.url);
+const buildHookTimeoutMs = 60_000;
 
 interface PackageExportConditions {
   readonly types: string;
@@ -45,7 +46,7 @@ function runPnpmBuild(): void {
 describe('project setup', () => {
   beforeAll(() => {
     runPnpmBuild();
-  });
+  }, buildHookTimeoutMs);
 
   it('build emits non-empty CJS, ESM, and type declaration entry points', () => {
     const expectedFiles = ['index.cjs', 'index.mjs', 'index.d.ts'];

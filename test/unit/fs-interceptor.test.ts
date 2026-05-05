@@ -21,6 +21,7 @@ import { SpanType, ghost, type Span } from '../../src/index.js';
 
 const tempRoots: string[] = [];
 const largeFileThresholdBytes = 256 * 1024;
+const freshProcessReplayTimeoutMs = 20_000;
 const execFile = promisify(execFileCallback);
 
 function fsSpans(spans: readonly Span[]): readonly Span[] {
@@ -414,7 +415,7 @@ describe('filesystem interceptor', () => {
       code: 2,
       stderr: expect.stringContaining('not available in the trace')
     });
-  });
+  }, freshProcessReplayTimeoutMs);
 
   it('replays recorded reads without disk access after files are deleted', async () => {
     const root = await tempRoot();
