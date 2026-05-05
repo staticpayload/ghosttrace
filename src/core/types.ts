@@ -1,3 +1,5 @@
+import type { RedactionOptions } from '../redaction/index.js';
+
 /** Trace file format version emitted by this release. */
 export const TRACE_FORMAT_VERSION = '1.0.0' as const;
 
@@ -127,6 +129,8 @@ export interface GhostTraceConfig {
   readonly traceDir?: string;
   /** Names of interceptors to activate. */
   readonly interceptors?: readonly string[];
+  /** Secret redaction settings applied before traces are persisted. */
+  readonly redaction?: RedactionOptions;
   /** Additional configuration reserved for plugins and future feature areas. */
   readonly metadata?: TraceMetadata;
 }
@@ -137,6 +141,8 @@ export interface RecordOptions {
   readonly metadata?: TraceMetadata;
   /** Optional interceptor selection. */
   readonly interceptors?: readonly string[];
+  /** Secret redaction settings applied before the recorded trace is returned or saved. */
+  readonly redaction?: RedactionOptions;
 }
 
 /** Options accepted by the foundation replay API placeholder. */

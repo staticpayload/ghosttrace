@@ -27,6 +27,7 @@ import {
   type InterceptorContext,
   type Teardown
 } from '../interceptors/index.js';
+import { redactTrace, redactValue } from '../redaction/index.js';
 
 interface RecordedSpan {
   readonly span: Span;
@@ -400,7 +401,7 @@ export async function record<TOutput>(
 
     try {
       const output = await runWithSpanContext(rootPendingSpan, fn);
-      rootOutput = serialize(output);
+      rootOutput = serialize(redactValue(output, options.redaction));
     } catch (error) {
       rootError = spanErrorFromUnknown(error);
       rootOutput = serialize(undefined);
@@ -435,5 +436,5 @@ export async function record<TOutput>(
     metadata
   };
 
-  return attachTraceSave(trace);
+  return attachTraceSave(redactTrace(trace, options.redaction));
 }

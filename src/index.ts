@@ -20,6 +20,7 @@ import {
   SpanType,
   type CreateTraceOptions,
   type GhostTraceConfig,
+  type RecordOptions,
   type ReplayOptions,
   type ReplayResult,
   type Span,
@@ -31,6 +32,13 @@ import {
 import { wrap, wrapModule } from './interceptors/function.js';
 import { wrapDb } from './interceptors/db.js';
 import { wrapQueue } from './interceptors/queue.js';
+import {
+  normalizeRedactionOptions,
+  redactTrace,
+  redactValue,
+  redactionPlaceholder,
+  type RedactionOptions
+} from './redaction/index.js';
 import { record, registerInterceptor } from './recorder/index.js';
 import { replay as replayTrace } from './replay/index.js';
 import { VERSION } from './version.js';
@@ -79,10 +87,10 @@ export {
   SpanType,
   type CreateTraceOptions,
   type GhostTraceConfig,
+  type RecordOptions,
   type ReplayMatchStrategy,
   type ReplayMode,
   type RecordedTrace,
-  type RecordOptions,
   type ReplayOptions,
   type ReplayResult,
   type Span,
@@ -130,6 +138,19 @@ export {
   wrapModule,
   wrapQueue
 } from './interceptors/index.js';
+export {
+  normalizeRedactionOptions,
+  redactTrace,
+  redactValue,
+  redactionPlaceholder
+} from './redaction/index.js';
+export type {
+  BuiltinRedactionPatternConfig,
+  BuiltinRedactionPatternName,
+  RedactionOptions,
+  RedactionPathRule,
+  RedactionRegexRule
+} from './redaction/index.js';
 export { record, registerInterceptor } from './recorder/index.js';
 
 function cloneMetadata(metadata: TraceMetadata | undefined): TraceMetadata {
@@ -140,6 +161,7 @@ function normalizeConfig(config: GhostTraceConfig): GhostTraceConfig {
   const normalized: {
     traceDir?: string;
     interceptors?: readonly string[];
+    redaction?: RedactionOptions;
     metadata?: TraceMetadata;
   } = {};
 
@@ -149,11 +171,44 @@ function normalizeConfig(config: GhostTraceConfig): GhostTraceConfig {
   if (config.interceptors !== undefined) {
     normalized.interceptors = [...config.interceptors];
   }
+  if (config.redaction !== undefined) {
+    normalized.redaction = normalizeRedactionOptions(config.redaction);
+  }
   if (config.metadata !== undefined) {
     normalized.metadata = cloneMetadata(config.metadata);
   }
 
   return normalized;
+}
+
+function mergeRecordOptions(config: GhostTraceConfig, options: RecordOptions | undefined): RecordOptions {
+  const merged: {
+    metadata?: TraceMetadata;
+    interceptors?: readonly string[];
+    redaction?: RedactionOptions;
+  } = {};
+  const configMetadata = config.metadata ?? {};
+  const optionMetadata = options?.metadata ?? {};
+  const metadata = {
+    ...configMetadata,
+    ...optionMetadata
+  };
+
+  if (Object.keys(metadata).length > 0) {
+    merged.metadata = metadata;
+  }
+  if (options?.interceptors !== undefined) {
+    merged.interceptors = options.interceptors;
+  } else if (config.interceptors !== undefined) {
+    merged.interceptors = config.interceptors;
+  }
+  if (options?.redaction !== undefined) {
+    merged.redaction = options.redaction;
+  } else if (config.redaction !== undefined) {
+    merged.redaction = config.redaction;
+  }
+
+  return merged;
 }
 
 /** Creates a Trace object with deterministic foundation defaults. */
@@ -195,7 +250,7 @@ export function createTracer(config: GhostTraceConfig = {}): Tracer {
 
   return {
     config: normalizedConfig,
-    record,
+    record: (name, fn, options) => record(name, fn, mergeRecordOptions(normalizedConfig, options)),
     replay,
     defineConfig
   };
@@ -218,6 +273,10 @@ export const ghost = {
   defaultTraceFileName,
   sanitizeTraceNameForFilename,
   saveTrace,
+  redactTrace,
+  redactValue,
+  redactionPlaceholder,
+  normalizeRedactionOptions,
   record,
   replay,
   serialize,
