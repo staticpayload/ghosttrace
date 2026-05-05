@@ -1,0 +1,81 @@
+{
+  "name": "ghosttrace",
+  "version": "0.1.0",
+  "description": "Deterministic record/replay, fixture, and contract-testing for TypeScript.",
+  "type": "module",
+  "packageManager": "pnpm@10.33.2",
+  "license": "MIT",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18.18"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "ghost": "./dist/cli/index.mjs"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./vitest": {
+      "types": "./dist/integrations/vitest.d.ts",
+      "import": "./dist/integrations/vitest.mjs",
+      "require": "./dist/integrations/vitest.cjs"
+    },
+    "./jest": {
+      "types": "./dist/integrations/jest.d.ts",
+      "import": "./dist/integrations/jest.mjs",
+      "require": "./dist/integrations/jest.cjs"
+    },
+    "./playwright": {
+      "types": "./dist/integrations/playwright.d.ts",
+      "import": "./dist/integrations/playwright.mjs",
+      "require": "./dist/integrations/playwright.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsup && node scripts/mark-cli-executable.mjs",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\" --max-warnings=0"
+  },
+  "dependencies": {
+    "cac": "7.0.0",
+    "picocolors": "1.1.1"
+  },
+  "peerDependencies": {
+    "@playwright/test": ">=1.59.0",
+    "jest": ">=30.0.0",
+    "vitest": ">=4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@playwright/test": {
+      "optional": true
+    },
+    "jest": {
+      "optional": true
+    },
+    "vitest": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "0.28.0",
+    "eslint": "10.3.0",
+    "tsup": "8.5.1",
+    "tsx": "4.21.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.59.2",
+    "vitest": "4.1.5"
+  }
+}
