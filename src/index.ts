@@ -28,6 +28,7 @@ import {
   type TraceableFunction,
   type Tracer
 } from './core/types.js';
+import { wrap, wrapModule } from './interceptors/function.js';
 import { record, registerInterceptor } from './recorder/index.js';
 import { VERSION } from './version.js';
 
@@ -94,7 +95,7 @@ export {
   type Tracer
 } from './core/types.js';
 export type { Interceptor, InterceptorContext, Teardown } from './interceptors/index.js';
-export { functionInterceptor, httpInterceptor, fsInterceptor } from './interceptors/index.js';
+export { functionInterceptor, httpInterceptor, fsInterceptor, wrap, wrapModule } from './interceptors/index.js';
 export { record, registerInterceptor } from './recorder/index.js';
 
 function cloneMetadata(metadata: TraceMetadata | undefined): TraceMetadata {
@@ -174,16 +175,6 @@ export function createTracer(config: GhostTraceConfig = {}): Tracer {
     replay,
     defineConfig
   };
-}
-
-/** Foundation wrapper that preserves a function until recording is implemented. */
-export function wrap<TFunction extends (...args: never[]) => unknown>(fn: TFunction): TFunction {
-  return fn;
-}
-
-/** Foundation module wrapper that preserves module exports until recording is implemented. */
-export function wrapModule<TModule extends object>(moduleExports: TModule): TModule {
-  return moduleExports;
 }
 
 /** Public namespace mirroring the named GhostTrace exports. */
