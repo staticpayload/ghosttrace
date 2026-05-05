@@ -46,6 +46,8 @@ export interface ReplayStore<TSpan extends Span = Span> {
   readonly consumeSpan: (type: SpanType, name: string, input: unknown) => ReplayConsumption<TSpan> | undefined;
   /** Returns all spans matched so far in replay order. */
   readonly matchedSpans: () => readonly ReplaySpanMatch<TSpan>[];
+  /** Returns replayable recorded spans that were not consumed. */
+  readonly unmatchedSpans: () => readonly TSpan[];
 }
 
 interface ReplayIndex<TSpan extends Span> {
@@ -139,6 +141,28 @@ function replayMissError(
   });
 }
 
+function isReplayableSpanType(type: SpanType): boolean {
+  return type !== SpanType.Function && type !== SpanType.Error;
+}
+
+function warnLenientPassthrough(
+  trace: Trace,
+  type: SpanType,
+  name: string,
+  sequence: number,
+  input: unknown,
+  availableSpanCount: number
+): void {
+  console.warn('GhostTrace lenient replay pass-through: no recorded span matched runtime call', {
+    traceId: trace.id,
+    spanType: type,
+    name,
+    sequence,
+    input,
+    availableSpanCount
+  });
+}
+
 /** Creates an indexed replay store over a trace's chronological span list. */
 export function createReplayStore<TSpan extends Span>(
   trace: Trace<TSpan>,
@@ -189,6 +213,7 @@ export function createReplayStore<TSpan extends Span>(
 
     if (selectedSpan === undefined) {
       if (mode === 'lenient') {
+        warnLenientPassthrough(trace, type, name, sequence, input, spanIndex.byType.get(type)?.length ?? 0);
         return undefined;
       }
 
@@ -217,7 +242,16 @@ export function createReplayStore<TSpan extends Span>(
     getSpanByCompositeKey,
     getSpanByGlobalSequence,
     consumeSpan,
-    matchedSpans: (): readonly ReplaySpanMatch<TSpan>[] => [...matches]
+    matchedSpans: (): readonly ReplaySpanMatch<TSpan>[] => [...matches],
+    unmatchedSpans: (): readonly TSpan[] =>
+      [...spanIndex.byGlobalSequence.values()]
+        .filter(
+          (candidate) =>
+            isReplayableSpanType(candidate.span.type) &&
+            canReplay(candidate.span.type) &&
+            !consumedGlobalSequences.has(candidate.globalSequence)
+        )
+        .map((candidate) => candidate.span)
   };
 }
 

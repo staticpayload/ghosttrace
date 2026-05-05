@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ReplayMismatchError,
   SpanType,
@@ -46,6 +46,10 @@ function trace(spans: readonly Span[]): Trace {
 }
 
 describe('ReplayStore', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('indexes spans by composite type:name:sequence key with direct lookup', () => {
     const firstFetch = span('span_http_1', SpanType.Http, 'fetch', { url: '/first' });
     const dbFetch = span('span_db_1', SpanType.Db, 'fetch', { url: '/first' });
@@ -106,6 +110,7 @@ describe('ReplayStore', () => {
     const otherHttp = span('span_http_other', SpanType.Http, 'http.request', { url: '/recorded' });
     const dbFetch = span('span_db_fetch', SpanType.Db, 'fetch', { url: '/recorded' });
     const store = createReplayStore(trace([otherHttp, dbFetch]), { mode: 'lenient' });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
     const match = store.consumeSpan(SpanType.Http, 'fetch', { url: '/runtime-only' });
     const missing = store.consumeSpan(SpanType.Http, 'fetch', { url: '/still-missing' });
@@ -114,6 +119,13 @@ describe('ReplayStore', () => {
     expect(store.matchedSpans().map((matched) => matched.strategy)).toEqual(['sequential']);
     expect(missing).toBeUndefined();
     expect(store.getSpan(SpanType.Db, 'fetch', 0)).toBe(dbFetch);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('GhostTrace lenient replay pass-through'),
+      expect.objectContaining({
+        spanType: SpanType.Http,
+        name: 'fetch'
+      })
+    );
   });
 
   it('throws ReplayMismatchError with diagnostics for misses and never reuses consumed spans', () => {
@@ -130,10 +142,18 @@ describe('ReplayStore', () => {
   it('isolates span types so a fetch call never matches a DB span with identical input', () => {
     const dbSpan = span('span_db', SpanType.Db, 'fetch', { url: '/same' });
     const store = createReplayStore(trace([dbSpan]), { mode: 'lenient' });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
     expect(store.consumeSpan(SpanType.Http, 'fetch', { url: '/same' })).toBeUndefined();
     expect(store.matchedSpans()).toEqual([]);
     expect(store.consumeSpan(SpanType.Db, 'fetch', { url: '/same' })?.span).toBe(dbSpan);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('GhostTrace lenient replay pass-through'),
+      expect.objectContaining({
+        spanType: SpanType.Http,
+        name: 'fetch'
+      })
+    );
   });
 
   it('atomically consumes distinct spans across 100 concurrent async operations', async () => {
