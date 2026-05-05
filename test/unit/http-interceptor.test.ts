@@ -58,6 +58,12 @@ function requireString(value: unknown, label: string): string {
   return value;
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 function readIncomingRequest(request: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -332,6 +338,7 @@ describe('HTTP interceptor', () => {
       'fetch-large-response',
       async () => {
         const response = await fetch('https://api.example.test/large');
+        await response.text();
         return response.status;
       },
       { interceptors: ['http'] }
@@ -345,6 +352,82 @@ describe('HTTP interceptor', () => {
     expect(body.limitBytes).toBe(1024 * 1024);
     expect(body.byteLength).toBe(largeBody.length);
     expect(text.length).toBeLessThan(largeBody.length);
+  });
+
+  it('returns streaming fetch responses before the body closes and captures direct body consumption lazily', async () => {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    const controllerReady = createDeferred<ReadableStreamDefaultController<Uint8Array>>();
+    const fetchSpy = vi.fn(async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('hello '));
+            controllerReady.resolve(controller);
+          }
+        }),
+        {
+          headers: {
+            'content-type': 'text/plain'
+          }
+        }
+      )
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const trace = await ghost.record(
+      'fetch-lazy-streaming',
+      async () => {
+        const responsePromise = fetch('https://api.example.test/lazy-stream');
+        const result = await Promise.race([
+          responsePromise.then((response) => ({ kind: 'response' as const, response })),
+          delay(25).then(() => ({ kind: 'timeout' as const }))
+        ]);
+
+        if (result.kind === 'timeout') {
+          const controller = await controllerReady.promise;
+          controller.close();
+        }
+
+        expect(result.kind).toBe('response');
+        if (result.kind !== 'response') {
+          return 'timed-out';
+        }
+
+        expect(result.response.body).not.toBeNull();
+        const reader = result.response.body!.getReader();
+        const first = await reader.read();
+        expect(first.done).toBe(false);
+
+        const controller = await controllerReady.promise;
+        controller.enqueue(encoder.encode('stream'));
+        controller.close();
+
+        const second = await reader.read();
+        const done = await reader.read();
+        reader.releaseLock();
+
+        return `${decoder.decode(first.value)}${decoder.decode(second.value)}:${String(done.done)}`;
+      },
+      { interceptors: ['http'] }
+    );
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(trace.spans[0]?.output).toBe('hello stream:true');
+    const span = httpSpans(trace.spans)[0];
+    expect(span).toMatchObject({
+      input: {
+        url: 'https://api.example.test/lazy-stream'
+      },
+      output: {
+        status: 200,
+        headers: {
+          'content-type': 'text/plain'
+        },
+        body: 'hello stream'
+      },
+      error: null
+    });
   });
 
   it('records fetch network errors, aborts, timeouts, and streaming response bodies', async () => {

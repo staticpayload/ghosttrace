@@ -357,11 +357,12 @@ describe('redaction engine', () => {
       const trace = await ghost.record(
         'cross-interceptor-redaction',
         async () => {
-          await fetch('https://example.com/secrets', {
+          const response = await fetch('https://example.com/secrets', {
             method: 'POST',
             headers: { authorization: envSecret },
             body: JSON.stringify({ apiKey: dbSecret })
           });
+          await response.text();
           await fsPromises.readFile(tempFile, 'utf8');
           await db.query('SELECT * FROM secrets WHERE id = ?', [1]);
           process.env[envKey] = envSecret;

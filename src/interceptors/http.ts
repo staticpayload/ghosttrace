@@ -61,9 +61,20 @@ interface TruncatedBodyRecord {
   readonly limitBytes: number;
 }
 
+interface PartialBodyRecord extends TruncatedBodyRecord {
+  readonly reason: string;
+}
+
 interface BodyUnavailableRecord {
   readonly unavailable: true;
   readonly reason: string;
+}
+
+interface BodyDeferredRecord {
+  readonly deferred: true;
+  readonly reason: string;
+  readonly byteLength?: number;
+  readonly limitBytes: number;
 }
 
 interface BodyMarkerRecord {
@@ -83,6 +94,33 @@ interface NodeRequestDetails {
 interface MutableClientRequestMethods {
   write: (this: ClientRequest, ...args: unknown[]) => boolean;
   end: (this: ClientRequest, ...args: unknown[]) => ClientRequest;
+}
+
+type MutableSpan = { -readonly [Key in keyof Span]: Span[Key] };
+
+interface BodyCaptureHandle {
+  readonly appendChunk: (chunk: unknown) => void;
+  readonly captureArrayBuffer: (body: ArrayBuffer) => void;
+  readonly captureBlob: (body: Blob) => Promise<void>;
+  readonly captureFormData: (body: FormData) => void;
+  readonly captureText: (body: string) => void;
+  readonly fail: (error: unknown) => void;
+  readonly finalize: () => void;
+}
+
+interface MutableReadableStreamMethods {
+  getReader: (...args: unknown[]) => unknown;
+  cancel?: (reason?: unknown) => Promise<void>;
+}
+
+interface MutableReadableStreamReaderMethods {
+  read: (...args: unknown[]) => Promise<unknown>;
+  cancel?: (reason?: unknown) => Promise<void>;
+}
+
+interface ReadableStreamReadResultRecord {
+  readonly done?: boolean;
+  readonly value?: unknown;
 }
 
 interface MutableIncomingMessage extends IncomingMessage {
@@ -168,6 +206,21 @@ function finalizeBodyAccumulator(accumulator: BodyAccumulator, reportedByteLengt
   } satisfies TruncatedBodyRecord;
 }
 
+function partialBodyAccumulator(accumulator: BodyAccumulator, reportedByteLength?: number): BodyDeferredRecord | PartialBodyRecord {
+  if (!accumulator.hasBody) {
+    return deferredBodyRecord(reportedByteLength);
+  }
+
+  return {
+    text: Buffer.concat(accumulator.chunks, accumulator.capturedBytes).toString('utf8'),
+    truncated: true,
+    byteLength: Math.max(accumulator.byteLength, reportedByteLength ?? 0),
+    capturedBytes: accumulator.capturedBytes,
+    limitBytes: MAX_CAPTURE_BYTES,
+    reason: 'response body capture is incomplete because the response body has not finished'
+  };
+}
+
 function captureBufferBody(buffer: Buffer, reportedByteLength?: number): unknown {
   const accumulator = createBodyAccumulator();
   appendBodyChunk(accumulator, buffer);
@@ -183,6 +236,36 @@ function bodyUnavailable(error: unknown): BodyUnavailableRecord {
     unavailable: true,
     reason: error instanceof Error ? error.message : String(error)
   };
+}
+
+function deferredBodyRecord(reportedByteLength?: number): BodyDeferredRecord | PartialBodyRecord {
+  if (reportedByteLength !== undefined && reportedByteLength > MAX_CAPTURE_BYTES) {
+    return {
+      text: '',
+      truncated: true,
+      byteLength: reportedByteLength,
+      capturedBytes: 0,
+      limitBytes: MAX_CAPTURE_BYTES,
+      reason: 'response body exceeds the capture limit and capture is deferred until the response body is consumed'
+    };
+  }
+
+  const record: {
+    deferred: true;
+    reason: string;
+    byteLength?: number;
+    limitBytes: number;
+  } = {
+    deferred: true,
+    reason: 'response body capture is deferred until the response body is consumed',
+    limitBytes: MAX_CAPTURE_BYTES
+  };
+
+  if (reportedByteLength !== undefined) {
+    record.byteLength = reportedByteLength;
+  }
+
+  return record;
 }
 
 function contentLengthFromHeaders(headers: Headers): number | undefined {
@@ -323,6 +406,20 @@ async function captureRequestObjectBody(request: Request): Promise<unknown> {
   }
 }
 
+function responseMetadataOutput(response: Response): Record<string, unknown> {
+  const output: Record<string, unknown> = {
+    status: response.status,
+    statusText: response.statusText,
+    headers: headersToRecord(response.headers)
+  };
+
+  if (response.body !== null) {
+    output.body = deferredBodyRecord(contentLengthFromHeaders(response.headers));
+  }
+
+  return output;
+}
+
 async function fetchInputDetails(input: RequestInfo | URL, init: RequestInit | undefined): Promise<Record<string, unknown>> {
   const request = typeof Request === 'undefined' ? undefined : input instanceof Request ? input : undefined;
   const initHeaders = normalizeHeaders(init?.headers);
@@ -340,26 +437,6 @@ async function fetchInputDetails(input: RequestInfo | URL, init: RequestInit | u
     },
     body
   };
-}
-
-async function responseOutput(response: Response): Promise<Record<string, unknown>> {
-  const baseOutput: Record<string, unknown> = {
-    status: response.status,
-    statusText: response.statusText,
-    headers: headersToRecord(response.headers)
-  };
-
-  try {
-    return {
-      ...baseOutput,
-      body: await captureReadableStreamBody(response.clone().body, contentLengthFromHeaders(response.headers))
-    };
-  } catch (error) {
-    return {
-      ...baseOutput,
-      body: bodyUnavailable(error)
-    };
-  }
 }
 
 function spanErrorFromUnknown(error: unknown): SpanError {
@@ -460,6 +537,202 @@ function completeHttpSpan(
   };
 }
 
+function updateSpanOutput(span: Span, output: unknown): void {
+  (span as MutableSpan).output = serialize(output);
+}
+
+function isReadResultRecord(value: unknown): value is ReadableStreamReadResultRecord {
+  return typeof value === 'object' && value !== null && 'done' in value;
+}
+
+function createBodyCaptureHandle(
+  span: Span,
+  baseOutput: Readonly<Record<string, unknown>>,
+  reportedByteLength?: number
+): BodyCaptureHandle {
+  const accumulator = createBodyAccumulator();
+  let finalized = false;
+
+  const setBody = (body: unknown): void => {
+    if (finalized) {
+      return;
+    }
+
+    finalized = true;
+    updateSpanOutput(span, {
+      ...baseOutput,
+      body
+    });
+  };
+
+  return {
+    appendChunk: (chunk: unknown): void => {
+      if (finalized) {
+        return;
+      }
+
+      const buffer = nodeChunkToBuffer(chunk, undefined);
+      if (buffer !== undefined) {
+        appendBodyChunk(accumulator, buffer);
+        updateSpanOutput(span, {
+          ...baseOutput,
+          body: partialBodyAccumulator(accumulator, reportedByteLength)
+        });
+      }
+    },
+    captureArrayBuffer: (body: ArrayBuffer): void => {
+      setBody(captureBufferBody(Buffer.from(body), reportedByteLength));
+    },
+    captureBlob: async (body: Blob): Promise<void> => {
+      setBody(await captureBlobBody(body));
+    },
+    captureFormData: (body: FormData): void => {
+      setBody(formDataBodyPreview(body));
+    },
+    captureText: (body: string): void => {
+      setBody(captureBufferBody(Buffer.from(body, 'utf8'), reportedByteLength));
+    },
+    fail: (error: unknown): void => {
+      setBody(bodyUnavailable(error));
+    },
+    finalize: (): void => {
+      setBody(finalizeBodyAccumulator(accumulator, reportedByteLength));
+    }
+  };
+}
+
+function patchReadableStreamReader(reader: unknown, capture: BodyCaptureHandle): unknown {
+  if (typeof reader !== 'object' || reader === null || typeof (reader as MutableReadableStreamReaderMethods).read !== 'function') {
+    return reader;
+  }
+
+  const mutableReader = reader as MutableReadableStreamReaderMethods;
+  const originalRead = mutableReader.read.bind(reader);
+  mutableReader.read = async (...args: unknown[]): Promise<unknown> => {
+    try {
+      const result = await originalRead(...args);
+      if (isReadResultRecord(result)) {
+        if (result.done === true) {
+          capture.finalize();
+        } else {
+          capture.appendChunk(result.value);
+        }
+      }
+
+      return result;
+    } catch (error) {
+      capture.fail(error);
+      throw error;
+    }
+  };
+
+  if (typeof mutableReader.cancel === 'function') {
+    const originalCancel = mutableReader.cancel.bind(reader);
+    mutableReader.cancel = async (reason?: unknown): Promise<void> => {
+      try {
+        await originalCancel(reason);
+        capture.finalize();
+      } catch (error) {
+        capture.fail(error);
+        throw error;
+      }
+    };
+  }
+
+  return reader;
+}
+
+function patchReadableStreamBodyCapture(stream: ReadableStream<Uint8Array>, capture: BodyCaptureHandle): void {
+  const mutableStream = stream as unknown as MutableReadableStreamMethods;
+  const originalGetReader = mutableStream.getReader.bind(stream);
+
+  mutableStream.getReader = (...args: unknown[]): unknown => {
+    return patchReadableStreamReader(originalGetReader(...args), capture);
+  };
+
+  if (typeof mutableStream.cancel === 'function') {
+    const originalCancel = mutableStream.cancel.bind(stream);
+    mutableStream.cancel = async (reason?: unknown): Promise<void> => {
+      try {
+        await originalCancel(reason);
+        capture.finalize();
+      } catch (error) {
+        capture.fail(error);
+        throw error;
+      }
+    };
+  }
+}
+
+function patchResponseBodyReaders(response: Response, capture: BodyCaptureHandle): void {
+  const mutableResponse = response as Response;
+  const originalText = response.text.bind(response);
+  const originalArrayBuffer = response.arrayBuffer.bind(response);
+  const originalBlob = response.blob.bind(response);
+
+  mutableResponse.text = async (): Promise<string> => {
+    try {
+      const text = await originalText();
+      capture.captureText(text);
+      return text;
+    } catch (error) {
+      capture.fail(error);
+      throw error;
+    }
+  };
+
+  mutableResponse.json = async (): Promise<unknown> => {
+    const text = await mutableResponse.text();
+    return JSON.parse(text) as unknown;
+  };
+
+  mutableResponse.arrayBuffer = async (): Promise<ArrayBuffer> => {
+    try {
+      const body = await originalArrayBuffer();
+      capture.captureArrayBuffer(body);
+      return body;
+    } catch (error) {
+      capture.fail(error);
+      throw error;
+    }
+  };
+
+  mutableResponse.blob = async (): Promise<Blob> => {
+    try {
+      const body = await originalBlob();
+      await capture.captureBlob(body);
+      return body;
+    } catch (error) {
+      capture.fail(error);
+      throw error;
+    }
+  };
+
+  if (typeof response.formData === 'function') {
+    const originalFormData = response.formData.bind(response);
+    mutableResponse.formData = async (): Promise<FormData> => {
+      try {
+        const body = await originalFormData();
+        capture.captureFormData(body);
+        return body;
+      } catch (error) {
+        capture.fail(error);
+        throw error;
+      }
+    };
+  }
+}
+
+function installLazyResponseBodyCapture(response: Response, span: Span, baseOutput: Readonly<Record<string, unknown>>): void {
+  const capture = createBodyCaptureHandle(span, baseOutput, contentLengthFromHeaders(response.headers));
+
+  if (response.body !== null) {
+    patchReadableStreamBodyCapture(response.body, capture);
+  }
+
+  patchResponseBodyReaders(response, capture);
+}
+
 function fetchImplementation(): typeof globalThis.fetch {
   if (originalFetch === undefined) {
     throw new TypeError('fetch is not available');
@@ -491,7 +764,17 @@ function installGlobalFetchPatch(): void {
 
     try {
       const response = await runWithSpanContext(span, () => fetch(input, init));
-      active.session.addSpan(completeHttpSpan(active.context, span, inputDetails, await responseOutput(response), null));
+      const output = responseMetadataOutput(response);
+      const completedSpan = completeHttpSpan(active.context, span, inputDetails, output, null);
+      active.session.addSpan(completedSpan);
+      try {
+        installLazyResponseBodyCapture(response, completedSpan, output);
+      } catch (error) {
+        updateSpanOutput(completedSpan, {
+          ...output,
+          body: bodyUnavailable(error)
+        });
+      }
       return response;
     } catch (error) {
       active.session.addSpan(completeHttpSpan(active.context, span, inputDetails, undefined, spanErrorFromUnknown(error)));

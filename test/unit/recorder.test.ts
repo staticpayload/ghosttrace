@@ -195,6 +195,7 @@ describe('recording engine', () => {
           method: 'POST',
           body: 'payload'
         });
+        await response.text();
         return response.status;
       },
       { interceptors: ['http'] }
