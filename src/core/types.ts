@@ -111,7 +111,7 @@ export interface GhostTraceConfig {
   readonly metadata?: TraceMetadata;
 }
 
-/** Options accepted by the foundation record API placeholder. */
+/** Options accepted by the recording API. */
 export interface RecordOptions {
   /** Additional trace metadata supplied by the caller. */
   readonly metadata?: TraceMetadata;

@@ -19,7 +19,6 @@ import {
   SpanType,
   type CreateTraceOptions,
   type GhostTraceConfig,
-  type RecordOptions,
   type ReplayOptions,
   type ReplayResult,
   type Span,
@@ -28,6 +27,7 @@ import {
   type TraceableFunction,
   type Tracer
 } from './core/types.js';
+import { record, registerInterceptor } from './recorder/index.js';
 import { VERSION } from './version.js';
 
 export { VERSION } from './version.js';
@@ -89,6 +89,7 @@ export {
 } from './core/types.js';
 export type { Interceptor, InterceptorContext, Teardown } from './interceptors/index.js';
 export { functionInterceptor, httpInterceptor, fsInterceptor } from './interceptors/index.js';
+export { record, registerInterceptor } from './recorder/index.js';
 
 function cloneMetadata(metadata: TraceMetadata | undefined): TraceMetadata {
   return metadata === undefined ? {} : { ...metadata };
@@ -145,18 +146,6 @@ export function defineConfig(config: GhostTraceConfig = {}): GhostTraceConfig {
   return normalizeConfig(config);
 }
 
-/** Records a named function execution in future recording-engine features. */
-export async function record<TOutput>(
-  name: string,
-  fn: TraceableFunction<TOutput>,
-  options: RecordOptions = {}
-): Promise<Trace> {
-  void name;
-  void fn;
-  void options;
-  throw notImplemented('record');
-}
-
 /** Replays a function using a trace object or trace file path in future replay features. */
 export async function replay<TOutput, TSpan extends Span = Span>(
   trace: Trace<TSpan> | string,
@@ -211,6 +200,7 @@ export const ghost = {
   deserialize,
   stringifySerialized,
   writeSerializedJson,
+  registerInterceptor,
   wrap,
   wrapModule,
   GhostTraceError,
