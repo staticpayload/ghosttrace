@@ -1,6 +1,7 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   SpanType,
+  createTracer,
   ghost,
   type ReplayResult,
   type ReplaySpanMatch,
@@ -191,5 +192,77 @@ describe('core data model types', () => {
       readonly ok: true;
       readonly value: 3;
     }>();
+  });
+
+  it('threads custom span generics through replay API results', () => {
+    interface CustomReplaySpan
+      extends Span<
+        { readonly operation: 'fetch-user'; readonly userId: string },
+        { readonly status: 200; readonly body: { readonly name: string } }
+      > {
+      readonly customKind: 'http-fixture';
+      readonly metadata: SpanMetadata & {
+        readonly requestId: string;
+      };
+    }
+
+    const customSpan = {
+      id: 'span_0002',
+      parentId: null,
+      type: SpanType.Http,
+      name: 'GET /users/123',
+      startTime: 0,
+      endTime: 5,
+      duration: 5,
+      input: { operation: 'fetch-user', userId: '123' },
+      output: { status: 200, body: { name: 'Ada' } },
+      children: [],
+      error: null,
+      metadata: { requestId: 'req_123' },
+      customKind: 'http-fixture'
+    } satisfies CustomReplaySpan;
+
+    const customTrace: Trace<CustomReplaySpan> = {
+      id: 'trace_0002',
+      name: 'custom replay trace',
+      version: '1.0.0',
+      startTime: 0,
+      endTime: 5,
+      duration: 5,
+      spans: [customSpan],
+      metadata: {}
+    };
+
+    function _ghostReplayForCustomTrace() {
+      return ghost.replay(customTrace, async () => ({ ok: true, userName: 'Ada' }) as const);
+    }
+
+    function _tracerReplayForCustomTrace() {
+      return createTracer().replay(customTrace, async () => ({ ok: true, userName: 'Ada' }) as const);
+    }
+
+    type GhostReplayResult = Awaited<ReturnType<typeof _ghostReplayForCustomTrace>>;
+    type TracerReplayResult = Awaited<ReturnType<typeof _tracerReplayForCustomTrace>>;
+
+    expectTypeOf<GhostReplayResult['output']>().toEqualTypeOf<{
+      readonly ok: true;
+      readonly userName: 'Ada';
+    }>();
+    expectTypeOf<TracerReplayResult['output']>().toEqualTypeOf<{
+      readonly ok: true;
+      readonly userName: 'Ada';
+    }>();
+    expectTypeOf<GhostReplayResult['spansMatched'][number]>().toEqualTypeOf<
+      ReplaySpanMatch<CustomReplaySpan>
+    >();
+    expectTypeOf<TracerReplayResult['spansMatched'][number]>().toEqualTypeOf<
+      ReplaySpanMatch<CustomReplaySpan>
+    >();
+    expectTypeOf<GhostReplayResult['spansMatched'][number]['span']['customKind']>().toEqualTypeOf<
+      'http-fixture'
+    >();
+    expectTypeOf<
+      TracerReplayResult['spansMatched'][number]['span']['metadata']['requestId']
+    >().toEqualTypeOf<string>();
   });
 });

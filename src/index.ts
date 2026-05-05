@@ -22,6 +22,7 @@ import {
   type RecordOptions,
   type ReplayOptions,
   type ReplayResult,
+  type Span,
   type Trace,
   type TraceMetadata,
   type TraceableFunction,
@@ -157,11 +158,11 @@ export async function record<TOutput>(
 }
 
 /** Replays a function using a trace object or trace file path in future replay features. */
-export async function replay<TOutput>(
-  trace: Trace | string,
+export async function replay<TOutput, TSpan extends Span = Span>(
+  trace: Trace<TSpan> | string,
   fn: TraceableFunction<TOutput>,
   options: ReplayOptions = {}
-): Promise<ReplayResult<Awaited<TOutput>>> {
+): Promise<ReplayResult<Awaited<TOutput>, TSpan>> {
   void trace;
   void fn;
   void options;

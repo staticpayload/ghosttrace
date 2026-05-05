@@ -169,11 +169,11 @@ export interface Tracer {
     options?: RecordOptions
   ) => Promise<Trace>;
   /** Replays a function using a trace object or trace file path. */
-  readonly replay: <TOutput>(
-    trace: Trace | string,
+  readonly replay: <TOutput, TSpan extends Span = Span>(
+    trace: Trace<TSpan> | string,
     fn: TraceableFunction<TOutput>,
     options?: ReplayOptions
-  ) => Promise<ReplayResult<Awaited<TOutput>>>;
+  ) => Promise<ReplayResult<Awaited<TOutput>, TSpan>>;
   /** Validates and normalizes configuration. */
   readonly defineConfig: (config: GhostTraceConfig) => GhostTraceConfig;
 }
