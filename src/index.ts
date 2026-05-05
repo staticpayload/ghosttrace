@@ -41,6 +41,7 @@ import {
 } from './redaction/index.js';
 import { record, registerInterceptor } from './recorder/index.js';
 import { replay as replayTrace } from './replay/index.js';
+import { diff } from './contract/diff.js';
 import { VERSION } from './version.js';
 
 export { VERSION } from './version.js';
@@ -152,6 +153,22 @@ export type {
   RedactionRegexRule
 } from './redaction/index.js';
 export { record, registerInterceptor } from './recorder/index.js';
+export { diff } from './contract/diff.js';
+export type {
+  AddedSpanChange,
+  ChangedFieldChange,
+  DiffChange,
+  DiffChangeSeverity,
+  DiffChangeType,
+  DiffComparator,
+  DiffComparatorContext,
+  DiffOptions,
+  DiffResult,
+  DiffStats,
+  DiffStatus,
+  DiffWarning,
+  RemovedSpanChange
+} from './contract/diff.js';
 
 function cloneMetadata(metadata: TraceMetadata | undefined): TraceMetadata {
   return metadata === undefined ? {} : { ...metadata };
@@ -279,6 +296,7 @@ export const ghost = {
   normalizeRedactionOptions,
   record,
   replay,
+  diff,
   serialize,
   deserialize,
   stringifySerialized,
