@@ -10,17 +10,40 @@ const COMBINING_MARK = /[\u0300-\u036f]/gu;
 const REPEATED_DASH = /-+/gu;
 const EDGE_SEPARATORS = /^[._-]+|[._-]+$/gu;
 const MAX_SAFE_NAME_LENGTH = 80;
+const MAX_VALID_DATE_MS = 8_640_000_000_000_000;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function traceTimestamp(trace: Trace): string {
-  if (!Number.isFinite(trace.startTime)) {
-    return '0';
+function isValidDateTimestamp(timestampMs: number): boolean {
+  return Number.isFinite(timestampMs) && Math.abs(timestampMs) <= MAX_VALID_DATE_MS;
+}
+
+function metadataTimestampMs(value: unknown): number | undefined {
+  if (value instanceof Date) {
+    const timestampMs = value.getTime();
+    return isValidDateTimestamp(timestampMs) ? timestampMs : undefined;
   }
 
-  return String(Math.max(0, Math.trunc(trace.startTime)));
+  if (typeof value === 'number') {
+    return isValidDateTimestamp(value) ? value : undefined;
+  }
+
+  if (typeof value === 'string') {
+    const timestampMs = Date.parse(value);
+    return isValidDateTimestamp(timestampMs) ? timestampMs : undefined;
+  }
+
+  return undefined;
+}
+
+function isoTimestamp(timestampMs: number): string {
+  return new Date(timestampMs).toISOString();
+}
+
+function traceTimestamp(trace: Trace): string {
+  return isoTimestamp(metadataTimestampMs(trace.metadata.recordedAt) ?? Date.now());
 }
 
 function looksLikeDirectoryTarget(target: string): boolean {
@@ -124,7 +147,7 @@ export function sanitizeTraceNameForFilename(name: string): string {
   return sanitized.length === 0 ? 'trace' : sanitized;
 }
 
-/** Returns the default deterministic filename for a trace. */
+/** Returns the default timestamped filename for a trace. */
 export function defaultTraceFileName(trace: Trace): string {
   return `${sanitizeTraceNameForFilename(trace.name)}.${traceTimestamp(trace)}${TRACE_FILE_SUFFIX}`;
 }

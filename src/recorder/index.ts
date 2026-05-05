@@ -46,6 +46,7 @@ const interceptorRegistry = new Map<string, Interceptor>(
 );
 
 let nextTraceSequence = 1;
+let lastRecordingTimestampMs = 0;
 
 function nextTraceId(): string {
   const traceId = `trace_${String(nextTraceSequence).padStart(4, '0')}`;
@@ -57,10 +58,19 @@ function cloneMetadata(metadata: TraceMetadata | undefined): TraceMetadata {
   return metadata === undefined ? {} : { ...metadata };
 }
 
+function nextRecordedAt(): string {
+  const now = Date.now();
+  const timestampMs = now <= lastRecordingTimestampMs ? lastRecordingTimestampMs + 1 : now;
+  lastRecordingTimestampMs = timestampMs;
+
+  return new Date(timestampMs).toISOString();
+}
+
 function createRecordingMetadata(name: string, metadata: TraceMetadata | undefined): TraceMetadata {
   return {
     ...cloneMetadata(metadata),
-    name
+    name,
+    recordedAt: nextRecordedAt()
   };
 }
 
@@ -147,9 +157,18 @@ function createErrorSpan(context: TraceContext, name: string, error: unknown, me
   };
 }
 
-function normalizeSpan(span: Span, traceStartTime: number): Span {
-  const startTime = Math.max(traceStartTime, span.startTime);
-  const endTime = Math.max(startTime, span.endTime);
+function clampTimestamp(timestamp: number, minimum: number, maximum: number): number {
+  if (!Number.isFinite(timestamp)) {
+    return minimum;
+  }
+
+  return Math.min(Math.max(timestamp, minimum), maximum);
+}
+
+function normalizeSpan(span: Span, traceStartTime: number, traceEndTime: number): Span {
+  const boundedTraceEndTime = Math.max(traceStartTime, traceEndTime);
+  const startTime = clampTimestamp(span.startTime, traceStartTime, boundedTraceEndTime);
+  const endTime = clampTimestamp(span.endTime, startTime, boundedTraceEndTime);
 
   return {
     ...span,
@@ -182,9 +201,13 @@ function buildChildren(
   };
 }
 
-function buildChronologicalSpanTree(recordedSpans: readonly RecordedSpan[], traceStartTime: number): readonly Span[] {
+function buildChronologicalSpanTree(
+  recordedSpans: readonly RecordedSpan[],
+  traceStartTime: number,
+  traceEndTime: number
+): readonly Span[] {
   const sortedSpans = recordedSpans
-    .map(({ span, order }) => ({ span: normalizeSpan(span, traceStartTime), order }))
+    .map(({ span, order }) => ({ span: normalizeSpan(span, traceStartTime, traceEndTime), order }))
     .sort((left, right) => left.span.startTime - right.span.startTime || left.order - right.order);
   const spanIds = new Set(sortedSpans.map(({ span }) => span.id));
   const childrenByParentId = new Map<string, Span[]>();
@@ -369,7 +392,8 @@ export async function record<TOutput>(
       },
       ...recordedSpans
     ],
-    rootSpan.startTime
+    rootSpan.startTime,
+    rootSpan.endTime
   );
   const endTime = traceEndTime(spans, rootSpan.endTime);
 

@@ -9,6 +9,7 @@ import {
 } from '../../src/index.js';
 
 const unregisterCallbacks: Array<() => void> = [];
+const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -79,7 +80,8 @@ describe('recording engine', () => {
       startTime: 0,
       metadata: {
         name: 'my-flow',
-        env: 'test'
+        env: 'test',
+        recordedAt: expect.stringMatching(ISO_TIMESTAMP_PATTERN)
       }
     });
     expect(trace.id).toEqual(expect.stringMatching(/^trace_\d{4}$/u));
@@ -242,6 +244,7 @@ describe('recording engine', () => {
       name: 'outside-bounds',
       install: (context: InterceptorContext) => {
         context.addSpan({ ...spanWithTiming('outside', SpanType.Fs, 'outside', -5, -1), duration: 999 });
+        context.addSpan({ ...spanWithTiming('late-outside', SpanType.Http, 'late-outside', 50, 75), duration: 999 });
         return () => undefined;
       },
       isAvailable: () => true
@@ -251,11 +254,21 @@ describe('recording engine', () => {
       interceptors: ['outside-bounds']
     });
     const allSpans = collectSpans(trace.spans);
+    const rootSpan = allSpans.find((span) => span.id === 'span_0001');
+    const lateSpan = allSpans.find((span) => span.id === 'late-outside');
+
+    if (rootSpan === undefined || lateSpan === undefined) {
+      throw new Error('expected root and late out-of-bounds spans to be present');
+    }
 
     expect(trace.duration).toBe(trace.endTime - trace.startTime);
+    expect(trace.duration).toBe(rootSpan.duration);
     expect(allSpans.every((span) => span.duration === span.endTime - span.startTime)).toBe(true);
     expect(allSpans.every((span) => span.startTime >= trace.startTime)).toBe(true);
     expect(allSpans.every((span) => span.endTime <= trace.endTime)).toBe(true);
+    expect(allSpans.every((span) => span.endTime <= trace.duration)).toBe(true);
+    expect(lateSpan.startTime).toBe(trace.duration);
+    expect(lateSpan.endTime).toBe(trace.duration);
   });
 
   it('keeps ten sequential recordings isolated', async () => {

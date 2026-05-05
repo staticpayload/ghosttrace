@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ExportError, ghost } from '../../src/index.js';
 
 const tempDirs: string[] = [];
+const ISO_TIMESTAMP_PATTERN_SOURCE = String.raw`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z`;
+const ISO_TIMESTAMP_PATTERN = new RegExp(`^${ISO_TIMESTAMP_PATTERN_SOURCE}$`, 'u');
 
 async function createTempDir(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), 'ghosttrace-save-'));
@@ -36,7 +38,12 @@ describe('trace persistence', () => {
 
     expect(savedPath).toBe(targetPath);
     expect(parsed.name).toBe('save-flow');
-    expect(parsed.metadata).toEqual({ name: 'save-flow' });
+    expect(parsed.metadata).toEqual(
+      expect.objectContaining({
+        name: 'save-flow',
+        recordedAt: expect.stringMatching(ISO_TIMESTAMP_PATTERN)
+      })
+    );
     expect(parsed.spans).toEqual(trace.spans);
     expect(parsed).not.toHaveProperty('save');
 
@@ -71,8 +78,43 @@ describe('trace persistence', () => {
     const savedPath = await trace.save({ directory });
     const parsed = await readJsonFile(savedPath);
 
-    expect(basename(savedPath)).toMatch(/^user-login-primary-admin\.\d+\.ghosttrace\.json$/u);
+    expect(basename(savedPath)).toMatch(
+      new RegExp(`^user-login-primary-admin\\.${ISO_TIMESTAMP_PATTERN_SOURCE}\\.ghosttrace\\.json$`, 'u')
+    );
     expect(parsed.name).toBe('User Login: primary/admin?');
-    expect(parsed.metadata).toEqual({ name: 'User Login: primary/admin?' });
+    expect(parsed.metadata).toEqual(
+      expect.objectContaining({
+        name: 'User Login: primary/admin?',
+        recordedAt: expect.stringMatching(ISO_TIMESTAMP_PATTERN)
+      })
+    );
+  });
+
+  it('uses wall-clock ISO timestamps for default filenames without same-name collisions', async () => {
+    const directory = await createTempDir();
+    const fixedWallClockTime = Date.now();
+    const dateNowSpy = vi.spyOn(Date, 'now').mockReturnValue(fixedWallClockTime);
+
+    const firstTrace = await ghost.record('Collision Flow', () => 'first', {
+      interceptors: []
+    });
+    const secondTrace = await ghost.record('Collision Flow', () => 'second', {
+      interceptors: []
+    });
+
+    const firstPath = await firstTrace.save({ directory });
+    const secondPath = await secondTrace.save({ directory });
+
+    expect(dateNowSpy).toHaveBeenCalled();
+    expect(firstPath).not.toBe(secondPath);
+    expect(basename(firstPath)).toMatch(
+      new RegExp(`^collision-flow\\.${ISO_TIMESTAMP_PATTERN_SOURCE}\\.ghosttrace\\.json$`, 'u')
+    );
+    expect(basename(secondPath)).toMatch(
+      new RegExp(`^collision-flow\\.${ISO_TIMESTAMP_PATTERN_SOURCE}\\.ghosttrace\\.json$`, 'u')
+    );
+    expect(basename(firstPath)).not.toBe(basename(secondPath));
+    expect(firstTrace.metadata.recordedAt).toEqual(expect.stringMatching(ISO_TIMESTAMP_PATTERN));
+    expect(secondTrace.metadata.recordedAt).toEqual(expect.stringMatching(ISO_TIMESTAMP_PATTERN));
   });
 });
