@@ -9,6 +9,7 @@ const SAFE_FILENAME_SEGMENT = /[^a-z0-9._-]+/gu;
 const COMBINING_MARK = /[\u0300-\u036f]/gu;
 const REPEATED_DASH = /-+/gu;
 const EDGE_SEPARATORS = /^[._-]+|[._-]+$/gu;
+const TIMESTAMP_FILENAME_SEPARATOR = /[:.]/gu;
 const MAX_SAFE_NAME_LENGTH = 80;
 const MAX_VALID_DATE_MS = 8_640_000_000_000_000;
 
@@ -42,8 +43,12 @@ function isoTimestamp(timestampMs: number): string {
   return new Date(timestampMs).toISOString();
 }
 
+function sanitizeTimestampForFilename(timestamp: string): string {
+  return timestamp.replace(TIMESTAMP_FILENAME_SEPARATOR, '-');
+}
+
 function traceTimestamp(trace: Trace): string {
-  return isoTimestamp(metadataTimestampMs(trace.metadata.recordedAt) ?? Date.now());
+  return sanitizeTimestampForFilename(isoTimestamp(metadataTimestampMs(trace.metadata.recordedAt) ?? Date.now()));
 }
 
 function looksLikeDirectoryTarget(target: string): boolean {

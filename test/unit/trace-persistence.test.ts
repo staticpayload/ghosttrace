@@ -8,6 +8,8 @@ import { ExportError, ghost } from '../../src/index.js';
 const tempDirs: string[] = [];
 const ISO_TIMESTAMP_PATTERN_SOURCE = String.raw`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z`;
 const ISO_TIMESTAMP_PATTERN = new RegExp(`^${ISO_TIMESTAMP_PATTERN_SOURCE}$`, 'u');
+const SANITIZED_TIMESTAMP_PATTERN_SOURCE = String.raw`\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z`;
+const UNSAFE_FILENAME_CHARACTER = /[<>:"/\\|?*\u0000-\u001F]/u;
 
 async function createTempDir(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), 'ghosttrace-save-'));
@@ -79,8 +81,9 @@ describe('trace persistence', () => {
     const parsed = await readJsonFile(savedPath);
 
     expect(basename(savedPath)).toMatch(
-      new RegExp(`^user-login-primary-admin\\.${ISO_TIMESTAMP_PATTERN_SOURCE}\\.ghosttrace\\.json$`, 'u')
+      new RegExp(`^user-login-primary-admin\\.${SANITIZED_TIMESTAMP_PATTERN_SOURCE}\\.ghosttrace\\.json$`, 'u')
     );
+    expect(basename(savedPath)).not.toMatch(UNSAFE_FILENAME_CHARACTER);
     expect(parsed.name).toBe('User Login: primary/admin?');
     expect(parsed.metadata).toEqual(
       expect.objectContaining({
@@ -107,13 +110,22 @@ describe('trace persistence', () => {
 
     expect(dateNowSpy).toHaveBeenCalled();
     expect(firstPath).not.toBe(secondPath);
-    expect(basename(firstPath)).toMatch(
-      new RegExp(`^collision-flow\\.${ISO_TIMESTAMP_PATTERN_SOURCE}\\.ghosttrace\\.json$`, 'u')
+    const firstFileName = basename(firstPath);
+    const secondFileName = basename(secondPath);
+    const filenamePattern = new RegExp(
+      `^collision-flow\\.(${SANITIZED_TIMESTAMP_PATTERN_SOURCE})\\.ghosttrace\\.json$`,
+      'u'
     );
-    expect(basename(secondPath)).toMatch(
-      new RegExp(`^collision-flow\\.${ISO_TIMESTAMP_PATTERN_SOURCE}\\.ghosttrace\\.json$`, 'u')
-    );
-    expect(basename(firstPath)).not.toBe(basename(secondPath));
+    const firstMatch = firstFileName.match(filenamePattern);
+    const secondMatch = secondFileName.match(filenamePattern);
+
+    expect(firstMatch).not.toBeNull();
+    expect(secondMatch).not.toBeNull();
+    expect(firstMatch?.[1]).not.toMatch(/[:.]/u);
+    expect(secondMatch?.[1]).not.toMatch(/[:.]/u);
+    expect(firstFileName).not.toMatch(UNSAFE_FILENAME_CHARACTER);
+    expect(secondFileName).not.toMatch(UNSAFE_FILENAME_CHARACTER);
+    expect(firstFileName).not.toBe(secondFileName);
     expect(firstTrace.metadata.recordedAt).toEqual(expect.stringMatching(ISO_TIMESTAMP_PATTERN));
     expect(secondTrace.metadata.recordedAt).toEqual(expect.stringMatching(ISO_TIMESTAMP_PATTERN));
   });
