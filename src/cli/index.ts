@@ -3,17 +3,35 @@ import { constants as fsConstants } from 'node:fs';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { inspect, isDeepStrictEqual } from 'node:util';
 import { cac, type CAC } from 'cac';
 import pc from 'picocolors';
 import {
   createTracer,
   defineConfig,
+  deserialize,
+  diff,
+  exportTrace,
+  replay,
+  SpanType,
   wrap,
+  type DiffChange,
+  type DiffOptions,
+  type DiffResult,
   type GhostTraceConfig,
+  type JsonExportMode,
+  type MermaidExportMode,
   type RecordedTrace,
   type RecordOptions,
+  type ReplayMode,
+  type ReplayOptions,
+  type SerializedJsonValue,
+  type Span,
+  type Trace,
+  type TraceExportFormat,
   type TraceableFunction
 } from '../index.js';
+import { loadValidatedTrace } from '../validation/index.js';
 import { VERSION } from '../version.js';
 
 const DEFAULT_TRACE_DIRECTORY = '__ghosttraces__';
@@ -44,9 +62,18 @@ const JEST_CONFIG_FILES = [
 const TYPESCRIPT_EXTENSIONS = new Set(['.ts', '.tsx', '.mts', '.cts']);
 const DEPENDENCY_FIELDS = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'] as const;
 const CONFIG_KEYS = ['traceDir', 'interceptors', 'redaction', 'metadata'] as const;
+const REPLAY_MODES = ['strict', 'lenient', 'partial'] as const satisfies readonly ReplayMode[];
+const DIFF_FORMATS = ['terminal', 'json', 'html'] as const;
+const DIFF_FAIL_ON_VALUES = ['breaking', 'drift', 'any', 'none'] as const;
+const EXPORT_FORMATS = ['json', 'markdown', 'mermaid', 'html'] as const satisfies readonly TraceExportFormat[];
+const JSON_EXPORT_MODES = ['pretty', 'compact'] as const satisfies readonly JsonExportMode[];
+const MERMAID_EXPORT_MODES = ['sequence', 'flowchart'] as const satisfies readonly MermaidExportMode[];
 
 type DetectedFramework = 'vitest' | 'jest' | 'node';
 type CliTargetFunction = (...args: unknown[]) => unknown;
+type DiffReportFormat = (typeof DIFF_FORMATS)[number];
+type DiffFailOn = (typeof DIFF_FAIL_ON_VALUES)[number];
+type ExportFormatterMode = JsonExportMode | MermaidExportMode;
 
 interface CliErrorOptions {
   readonly exitImmediately?: boolean;
@@ -58,6 +85,26 @@ interface RecordCommandOptions {
   readonly timeout?: unknown;
   readonly name?: unknown;
   readonly interceptors?: unknown;
+}
+
+interface ReplayCommandOptions {
+  readonly args?: unknown;
+  readonly mode?: unknown;
+  readonly replayTypes?: unknown;
+  readonly timeout?: unknown;
+}
+
+interface DiffCommandOptions {
+  readonly format?: unknown;
+  readonly failOn?: unknown;
+  readonly rules?: unknown;
+  readonly output?: unknown;
+}
+
+interface ExportCommandOptions {
+  readonly format?: unknown;
+  readonly output?: unknown;
+  readonly mode?: unknown;
 }
 
 interface PackageJsonLike {
@@ -99,6 +146,44 @@ export function createCli(): CAC {
     .option('--interceptors <names>', 'Comma-separated interceptor names to enable')
     .action(async (file: string | undefined, exportName: string | undefined, options: RecordCommandOptions): Promise<void> => {
       await runRecordCommand(process.cwd(), file, exportName, options);
+    });
+
+  cli
+    .command('replay [trace] [file] [exportName]', 'Replay a module export against a recorded trace')
+    .option('--args <json>', 'JSON array of arguments to pass to the export')
+    .option('--mode <mode>', 'Replay mode: strict, lenient, or partial')
+    .option('--replay-types <types>', 'Comma-separated span types to replay in partial mode')
+    .option('--timeout <ms>', 'Abort replay after the given timeout in milliseconds')
+    .action(async (
+      tracePath: string | undefined,
+      file: string | undefined,
+      exportName: string | undefined,
+      options: ReplayCommandOptions
+    ): Promise<void> => {
+      await runReplayCommand(process.cwd(), tracePath, file, exportName, options);
+    });
+
+  cli
+    .command('diff [baseline] [current]', 'Compare two GhostTrace trace files')
+    .option('--format <format>', 'Report format: terminal, json, or html')
+    .option('--fail-on <severity>', 'Exit 1 when the diff reaches severity: breaking, drift, any, or none')
+    .option('--rules <path>', 'JSON diff rules file')
+    .option('--output <path>', 'Write the diff report to a file instead of stdout')
+    .action(async (
+      baselinePath: string | undefined,
+      currentPath: string | undefined,
+      options: DiffCommandOptions
+    ): Promise<void> => {
+      await runDiffCommand(process.cwd(), baselinePath, currentPath, options);
+    });
+
+  cli
+    .command('export [trace]', 'Export a trace to json, markdown, mermaid, or html')
+    .option('--format <format>', 'Export format: json, markdown, mermaid, or html')
+    .option('--output <path>', 'Write the export output to a file')
+    .option('--mode <mode>', 'Formatter mode: pretty/compact for JSON, sequence/flowchart for Mermaid')
+    .action(async (tracePath: string | undefined, options: ExportCommandOptions): Promise<void> => {
+      await runExportCommand(process.cwd(), tracePath, options);
     });
 
   return cli;
@@ -454,6 +539,344 @@ function parseInterceptorsOption(value: unknown): readonly string[] | undefined 
   return interceptors;
 }
 
+function parseReplayModeOption(value: unknown): ReplayMode | undefined {
+  const optionValue = optionalOptionValue(value);
+  if (optionValue === undefined) {
+    return undefined;
+  }
+  if (typeof optionValue !== 'string' || !REPLAY_MODES.includes(optionValue as ReplayMode)) {
+    throw new CliError(`--mode must be one of: ${REPLAY_MODES.join(', ')}`);
+  }
+
+  return optionValue as ReplayMode;
+}
+
+function isSpanType(value: string): value is SpanType {
+  return (Object.values(SpanType) as readonly string[]).includes(value);
+}
+
+function parseReplayTypesOption(value: unknown): readonly SpanType[] | undefined {
+  const optionValue = optionalOptionValue(value);
+  if (optionValue === undefined) {
+    return undefined;
+  }
+
+  const rawValues = Array.isArray(optionValue) ? optionValue : [optionValue];
+  const replayTypes = rawValues.flatMap((rawValue): readonly SpanType[] => {
+    if (typeof rawValue !== 'string') {
+      throw new CliError('--replay-types must be a comma-separated string');
+    }
+
+    return rawValue.split(',').map((entry) => entry.trim()).filter((entry) => entry.length > 0).map((entry) => {
+      if (!isSpanType(entry)) {
+        throw new CliError(`Unknown replay span type "${entry}". Expected one of: ${Object.values(SpanType).join(', ')}`);
+      }
+
+      return entry;
+    });
+  });
+
+  if (replayTypes.length === 0) {
+    throw new CliError('--replay-types must include at least one span type');
+  }
+
+  return replayTypes;
+}
+
+function parseDiffFormatOption(value: unknown): DiffReportFormat {
+  const optionValue = optionalOptionValue(value);
+  if (optionValue === undefined) {
+    return 'terminal';
+  }
+  if (typeof optionValue !== 'string' || !DIFF_FORMATS.includes(optionValue as DiffReportFormat)) {
+    throw new CliError(`--format must be one of: ${DIFF_FORMATS.join(', ')}`);
+  }
+
+  return optionValue as DiffReportFormat;
+}
+
+function parseDiffFailOnOption(value: unknown): DiffFailOn {
+  const optionValue = optionalOptionValue(value);
+  if (optionValue === undefined) {
+    return 'none';
+  }
+  if (typeof optionValue !== 'string' || !DIFF_FAIL_ON_VALUES.includes(optionValue as DiffFailOn)) {
+    throw new CliError(`--fail-on must be one of: ${DIFF_FAIL_ON_VALUES.join(', ')}`);
+  }
+
+  return optionValue as DiffFailOn;
+}
+
+function parseExportFormatOption(value: unknown): TraceExportFormat {
+  const optionValue = optionalOptionValue(value);
+  if (optionValue === undefined) {
+    throw new CliError(`--format is required and must be one of: ${EXPORT_FORMATS.join(', ')}`);
+  }
+  if (typeof optionValue !== 'string' || !EXPORT_FORMATS.includes(optionValue as TraceExportFormat)) {
+    throw new CliError(`--format must be one of: ${EXPORT_FORMATS.join(', ')}`);
+  }
+
+  return optionValue as TraceExportFormat;
+}
+
+function parseExportModeOption(format: TraceExportFormat, value: unknown): ExportFormatterMode | undefined {
+  const optionValue = optionalOptionValue(value);
+  if (optionValue === undefined) {
+    return undefined;
+  }
+  if (typeof optionValue !== 'string') {
+    throw new CliError('--mode must be a string');
+  }
+
+  if (format === 'json') {
+    if (!JSON_EXPORT_MODES.includes(optionValue as JsonExportMode)) {
+      throw new CliError(`--mode for JSON export must be one of: ${JSON_EXPORT_MODES.join(', ')}`);
+    }
+
+    return optionValue as JsonExportMode;
+  }
+
+  if (format === 'mermaid') {
+    if (!MERMAID_EXPORT_MODES.includes(optionValue as MermaidExportMode)) {
+      throw new CliError(`--mode for Mermaid export must be one of: ${MERMAID_EXPORT_MODES.join(', ')}`);
+    }
+
+    return optionValue as MermaidExportMode;
+  }
+
+  throw new CliError(`--mode is only supported for json and mermaid exports, not ${format}`);
+}
+
+function optionalStringArray(value: unknown, description: string): readonly string[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value) || !value.every((entry): entry is string => typeof entry === 'string')) {
+    throw new CliError(`${description} must be an array of strings`);
+  }
+
+  return value;
+}
+
+function optionalBoolean(value: unknown, description: string): boolean | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'boolean') {
+    throw new CliError(`${description} must be a boolean`);
+  }
+
+  return value;
+}
+
+function normalizeDiffRules(value: unknown, sourcePath: string): DiffOptions {
+  if (!isRecord(value)) {
+    throw new CliError(`Rules file ${sourcePath} must contain a JSON object`);
+  }
+
+  const candidate = isRecord(value.diff) ? value.diff : value;
+  const rules: {
+    ignorePaths?: readonly string[];
+    allowNewSpans?: boolean;
+    allowRemovedSpans?: boolean;
+    breakingOn?: readonly string[];
+  } = {};
+  const ignorePaths = optionalStringArray(candidate.ignorePaths, 'rules.ignorePaths');
+  const allowNewSpans = optionalBoolean(candidate.allowNewSpans, 'rules.allowNewSpans');
+  const allowRemovedSpans = optionalBoolean(candidate.allowRemovedSpans, 'rules.allowRemovedSpans');
+  const breakingOn = optionalStringArray(candidate.breakingOn, 'rules.breakingOn');
+
+  if (ignorePaths !== undefined) {
+    rules.ignorePaths = ignorePaths;
+  }
+  if (allowNewSpans !== undefined) {
+    rules.allowNewSpans = allowNewSpans;
+  }
+  if (allowRemovedSpans !== undefined) {
+    rules.allowRemovedSpans = allowRemovedSpans;
+  }
+  if (breakingOn !== undefined) {
+    rules.breakingOn = breakingOn;
+  }
+
+  return rules;
+}
+
+async function loadDiffRules(cwd: string, value: unknown): Promise<{ readonly options: DiffOptions; readonly path: string } | undefined> {
+  const rulesPath = requireString(value, '--rules');
+  if (rulesPath === undefined) {
+    return undefined;
+  }
+
+  const absolutePath = resolve(cwd, rulesPath);
+  if (!(await pathExists(absolutePath))) {
+    throw new CliError(`Rules file not found: ${rulesPath}`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(absolutePath, 'utf8')) as unknown;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new CliError(`Failed to parse rules file ${rulesPath}: ${message}`);
+  }
+
+  return {
+    options: normalizeDiffRules(parsed, rulesPath),
+    path: absolutePath
+  };
+}
+
+function formatValue(value: unknown): string {
+  return inspect(value, {
+    colors: false,
+    depth: 8,
+    breakLength: 100,
+    sorted: true
+  });
+}
+
+function findReplayExpectationSpan(trace: Trace): Span {
+  const rootFunctionSpan = trace.spans.find((span) => span.type === SpanType.Function && span.parentId === null);
+  const fallbackSpan = rootFunctionSpan ?? trace.spans[0];
+
+  if (fallbackSpan === undefined) {
+    throw new CliError(`Trace ${trace.name} does not contain any spans to replay against`);
+  }
+
+  return fallbackSpan;
+}
+
+function deserializeTraceValue(value: unknown): unknown {
+  return deserialize(value as SerializedJsonValue);
+}
+
+function errorName(error: unknown): string {
+  return error instanceof Error ? error.name : error === null ? 'null' : typeof error;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function recordedErrorMatches(error: unknown, recorded: Span['error']): boolean {
+  if (recorded === null) {
+    return false;
+  }
+
+  return errorName(error) === recorded.name && errorMessage(error) === recorded.message;
+}
+
+function writeReplayPass(trace: Trace, mode: ReplayMode): void {
+  console.log(pc.green(`PASS replay matched ${trace.name} (${mode})`));
+}
+
+function writeReplayOutputMismatch(trace: Trace, expected: unknown, actual: unknown): void {
+  console.error(pc.red(`FAIL replay mismatch for ${trace.name}`));
+  console.error('Output mismatch:');
+  console.error(`Expected: ${formatValue(expected)}`);
+  console.error(`Actual:   ${formatValue(actual)}`);
+}
+
+function writeReplayErrorMismatch(trace: Trace, error: unknown): void {
+  console.error(pc.red(`FAIL replay mismatch for ${trace.name}`));
+  console.error(`Replay failed: ${errorName(error)}: ${errorMessage(error)}`);
+}
+
+function diffStatusText(result: DiffResult): string {
+  if (result.status === 'identical') {
+    return pc.green(result.status);
+  }
+  if (result.status === 'breaking') {
+    return pc.red(result.status);
+  }
+
+  return pc.yellow(result.status);
+}
+
+function diffSeverityText(severity: DiffChange['severity']): string {
+  return severity === 'breaking' ? pc.red(severity.toUpperCase()) : pc.yellow(severity.toUpperCase());
+}
+
+function formatDiffChange(change: DiffChange): string {
+  const prefix = `${diffSeverityText(change.severity)} ${change.type} ${change.spanPath} ${change.field}`;
+
+  if (change.type === 'changed') {
+    return [
+      prefix,
+      `  Expected: ${formatValue(change.baseline)}`,
+      `  Actual:   ${formatValue(change.current)}`
+    ].join('\n');
+  }
+
+  if (change.type === 'added') {
+    return [
+      prefix,
+      `  Added: ${formatValue({
+        id: change.current.id,
+        type: change.current.type,
+        name: change.current.name
+      })}`
+    ].join('\n');
+  }
+
+  return [
+    prefix,
+    `  Removed: ${formatValue({
+      id: change.baseline.id,
+      type: change.baseline.type,
+      name: change.baseline.name
+    })}`
+  ].join('\n');
+}
+
+function renderTerminalDiffReport(result: DiffResult, rulesPath: string | undefined): string {
+  const lines: string[] = [];
+
+  if (rulesPath !== undefined) {
+    lines.push(`Applied rules: ${rulesPath}`);
+  }
+
+  lines.push(`Diff status: ${diffStatusText(result)}`);
+  lines.push(result.summary);
+  lines.push(
+    `Stats: ${result.stats.breaking} breaking, ${result.stats.drift} drift, ${result.stats.added} added, ${result.stats.removed} removed, ${result.stats.changed} changed`
+  );
+
+  if (result.changes.length > 0) {
+    lines.push('');
+    lines.push('Changes:');
+    lines.push(...result.changes.map(formatDiffChange));
+  }
+
+  if (result.warnings.length > 0) {
+    lines.push('');
+    lines.push('Warnings:');
+    lines.push(...result.warnings.map((warning) => `${warning.path}: ${warning.message}`));
+  }
+
+  return `${lines.join('\n')}\n`;
+}
+
+function shouldFailOnDiff(result: DiffResult, failOn: DiffFailOn): boolean {
+  if (failOn === 'none') {
+    return false;
+  }
+  if (failOn === 'breaking') {
+    return result.stats.breaking > 0;
+  }
+  if (failOn === 'drift') {
+    return result.stats.breaking > 0 || result.stats.drift > 0;
+  }
+
+  return result.stats.total > 0;
+}
+
+async function writeTextOutput(outputPath: string, content: string): Promise<void> {
+  await mkdir(dirname(outputPath), { recursive: true });
+  await writeFile(outputPath, content, 'utf8');
+}
+
 function selectedExport(moduleExports: Readonly<Record<string, unknown>>, exportName: string): unknown {
   if (Object.prototype.hasOwnProperty.call(moduleExports, exportName)) {
     return moduleExports[exportName];
@@ -549,6 +972,164 @@ async function runRecordCommand(
   const savedPath = await trace.save(output ?? defaultTraceSaveTarget(cwd, config));
 
   console.log(pc.green(`Trace saved to ${resolve(cwd, savedPath)}`));
+}
+
+async function runReplayCommand(
+  cwd: string,
+  tracePath: string | undefined,
+  file: string | undefined,
+  exportName: string | undefined,
+  options: ReplayCommandOptions
+): Promise<void> {
+  if (tracePath === undefined || file === undefined || exportName === undefined) {
+    throw new CliError('Usage: ghost replay <trace> <file> <export> [--args JSON_ARRAY] [--mode strict|lenient|partial]');
+  }
+
+  const filePath = resolve(cwd, file);
+  if (!(await pathExists(filePath))) {
+    throw new CliError(`File not found: ${file}`);
+  }
+
+  const args = parseArgsOption(options.args);
+  const mode = parseReplayModeOption(options.mode) ?? 'strict';
+  const replayTypes = parseReplayTypesOption(options.replayTypes);
+  const timeoutMs = parseTimeoutOption(options.timeout);
+  const trace = await loadValidatedTrace(resolve(cwd, tracePath), 'replay');
+  const expectedSpan = findReplayExpectationSpan(trace);
+  const moduleExports = await importModule(filePath);
+  const targetFunction = assertTargetFunction(selectedExport(moduleExports, exportName), exportName);
+  const replayOptions: {
+    mode: ReplayMode;
+    replayTypes?: readonly SpanType[];
+    timeout?: number;
+  } = { mode };
+
+  if (replayTypes !== undefined) {
+    replayOptions.replayTypes = replayTypes;
+  }
+  if (timeoutMs !== undefined) {
+    replayOptions.timeout = timeoutMs;
+  }
+
+  try {
+    const result = await replay(
+      trace,
+      (() => targetFunction(...args)) as TraceableFunction<unknown>,
+      replayOptions satisfies ReplayOptions
+    );
+
+    if (expectedSpan.error !== null) {
+      writeReplayOutputMismatch(trace, `${expectedSpan.error.name}: ${expectedSpan.error.message}`, result.output);
+      process.exitCode = 1;
+      return;
+    }
+
+    const expectedOutput = deserializeTraceValue(expectedSpan.output);
+    if (!isDeepStrictEqual(expectedOutput, result.output)) {
+      writeReplayOutputMismatch(trace, expectedOutput, result.output);
+      process.exitCode = 1;
+      return;
+    }
+
+    writeReplayPass(trace, mode);
+  } catch (error) {
+    if (recordedErrorMatches(error, expectedSpan.error)) {
+      writeReplayPass(trace, mode);
+      return;
+    }
+
+    writeReplayErrorMismatch(trace, error);
+    process.exitCode = 1;
+  }
+}
+
+async function renderDiffReport(
+  format: DiffReportFormat,
+  baselineTrace: Trace,
+  currentTrace: Trace,
+  result: DiffResult,
+  rulesPath: string | undefined
+): Promise<string> {
+  if (format === 'json') {
+    return `${JSON.stringify(result, null, 2)}\n`;
+  }
+  if (format === 'html') {
+    return exportTrace(currentTrace, {
+      format: 'html',
+      diff: result,
+      baselineTrace
+    });
+  }
+
+  return renderTerminalDiffReport(result, rulesPath);
+}
+
+async function runDiffCommand(
+  cwd: string,
+  baselinePath: string | undefined,
+  currentPath: string | undefined,
+  options: DiffCommandOptions
+): Promise<void> {
+  if (baselinePath === undefined || currentPath === undefined) {
+    throw new CliError('Usage: ghost diff <baseline-trace> <current-trace> [--format terminal|json|html]');
+  }
+
+  const format = parseDiffFormatOption(options.format);
+  const failOn = parseDiffFailOnOption(options.failOn);
+  const output = requireString(options.output, '--output');
+  const rules = await loadDiffRules(cwd, options.rules);
+  const baselineTrace = await loadValidatedTrace(resolve(cwd, baselinePath), 'baseline');
+  const currentTrace = await loadValidatedTrace(resolve(cwd, currentPath), 'current');
+  const result = diff(baselineTrace, currentTrace, rules?.options) as DiffResult;
+  const report = await renderDiffReport(format, baselineTrace, currentTrace, result, rules?.path);
+
+  if (output === undefined) {
+    process.stdout.write(report);
+  } else {
+    const outputPath = resolve(cwd, output);
+    await writeTextOutput(outputPath, report);
+    console.log(pc.green(`Diff report written to ${outputPath}`));
+  }
+
+  if (shouldFailOnDiff(result, failOn)) {
+    console.error(pc.red(`Diff contains ${failOn === 'any' ? 'changes' : `${failOn} changes`}; failing because --fail-on ${failOn} was set.`));
+    process.exitCode = 1;
+  }
+}
+
+async function runExportCommand(
+  cwd: string,
+  tracePath: string | undefined,
+  options: ExportCommandOptions
+): Promise<void> {
+  if (tracePath === undefined) {
+    throw new CliError('Usage: ghost export <trace> --format json|markdown|mermaid|html [--output path]');
+  }
+
+  const format = parseExportFormatOption(options.format);
+  const output = requireString(options.output, '--output');
+  const mode = parseExportModeOption(format, options.mode);
+  const trace = await loadValidatedTrace(resolve(cwd, tracePath), 'export');
+  const exportOptions: {
+    format: TraceExportFormat;
+    output?: string;
+    mode?: ExportFormatterMode;
+  } = { format };
+
+  if (output !== undefined) {
+    exportOptions.output = resolve(cwd, output);
+  }
+  if (mode !== undefined) {
+    exportOptions.mode = mode;
+  }
+
+  const contentOrPath = await exportTrace(trace, exportOptions);
+  if (output === undefined) {
+    process.stdout.write(contentOrPath);
+    return;
+  }
+
+  console.log(pc.green(`Exported trace to ${contentOrPath}`));
 }
 
 if (isDirectExecution()) {

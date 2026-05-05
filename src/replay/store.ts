@@ -19,6 +19,7 @@ export {
 } from './matcher.js';
 
 const REPLAY_STORE_MARKER = Symbol.for('ghosttrace.replayStore');
+let lenientWarningInProgress = false;
 
 /** Recorded span returned by a replay-store consumption. */
 export interface ReplayConsumption<TSpan extends Span = Span> {
@@ -174,14 +175,23 @@ function warnLenientPassthrough(
   input: unknown,
   availableSpanCount: number
 ): void {
-  console.warn('GhostTrace lenient replay pass-through: no recorded span matched runtime call', {
-    traceId: trace.id,
-    spanType: type,
-    name,
-    sequence,
-    input,
-    availableSpanCount
-  });
+  if (lenientWarningInProgress) {
+    return;
+  }
+
+  lenientWarningInProgress = true;
+  try {
+    console.warn('GhostTrace lenient replay pass-through: no recorded span matched runtime call', {
+      traceId: trace.id,
+      spanType: type,
+      name,
+      sequence,
+      input,
+      availableSpanCount
+    });
+  } finally {
+    lenientWarningInProgress = false;
+  }
 }
 
 /** Creates an indexed replay store over a trace's chronological span list. */
