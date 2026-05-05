@@ -577,7 +577,7 @@ function activeHttpContext(): ActiveHttpContext | undefined {
     return undefined;
   }
 
-  const session = activeHttpSessions.get(context.traceId);
+  const session = activeHttpSessions.get(context.sessionId);
   if (session === undefined) {
     return undefined;
   }
@@ -1548,7 +1548,7 @@ export const httpInterceptor: Interceptor = {
       return () => undefined;
     }
 
-    activeHttpSessions.set(traceContext.traceId, {
+    activeHttpSessions.set(traceContext.sessionId, {
       addSpan: context.addSpan
     });
     installGlobalFetchPatch();
@@ -1561,7 +1561,7 @@ export const httpInterceptor: Interceptor = {
         return;
       }
       installed = false;
-      activeHttpSessions.delete(traceContext.traceId);
+      activeHttpSessions.delete(traceContext.sessionId);
       restoreGlobalFetchPatchIfIdle();
       restoreNodeRequestPatchesIfIdle();
     };

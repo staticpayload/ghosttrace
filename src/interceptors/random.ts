@@ -48,7 +48,7 @@ function activeRandomContext(): ActiveRandomContext | undefined {
     return undefined;
   }
 
-  const session = activeRandomSessions.get(context.traceId);
+  const session = activeRandomSessions.get(context.sessionId);
   if (session === undefined) {
     return undefined;
   }
@@ -357,7 +357,7 @@ export const randomInterceptor: Interceptor = {
       return () => undefined;
     }
 
-    activeRandomSessions.set(traceContext.traceId, {
+    activeRandomSessions.set(traceContext.sessionId, {
       addSpan: context.addSpan
     });
     installRandomPatches();
@@ -370,7 +370,7 @@ export const randomInterceptor: Interceptor = {
       }
 
       installed = false;
-      activeRandomSessions.delete(traceContext.traceId);
+      activeRandomSessions.delete(traceContext.sessionId);
       restoreRandomPatchesIfIdle();
     };
   },

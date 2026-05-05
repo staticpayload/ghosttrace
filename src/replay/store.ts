@@ -1,4 +1,4 @@
-import { ReplayMismatchError } from '../core/errors.js';
+import { ReplayExhaustedError, ReplayMismatchError } from '../core/errors.js';
 import {
   SpanType,
   type ReplayMode,
@@ -141,6 +141,27 @@ function replayMissError(
   });
 }
 
+function replayExhaustedError(
+  trace: Trace,
+  type: SpanType,
+  name: string,
+  sequence: number,
+  input: unknown,
+  availableSpanCount: number
+): ReplayExhaustedError {
+  return new ReplayExhaustedError(`Replay exhausted recorded spans for ${type}:${name}`, {
+    traceId: trace.id,
+    context: {
+      spanType: type,
+      name,
+      sequence,
+      input,
+      attemptedCount: sequence + 1,
+      availableSpanCount
+    }
+  });
+}
+
 function isReplayableSpanType(type: SpanType): boolean {
   return type !== SpanType.Function && type !== SpanType.Error;
 }
@@ -212,9 +233,13 @@ export function createReplayStore<TSpan extends Span>(
     });
 
     if (selectedSpan === undefined) {
+      const typeNameCandidateCount = spanIndex.byTypeName.get(key)?.length ?? 0;
       if (mode === 'lenient') {
         warnLenientPassthrough(trace, type, name, sequence, input, spanIndex.byType.get(type)?.length ?? 0);
         return undefined;
+      }
+      if (typeNameCandidateCount > 0 && sequence >= typeNameCandidateCount) {
+        throw replayExhaustedError(trace, type, name, sequence, input, typeNameCandidateCount);
       }
 
       throw replayMissError(trace, type, name, sequence, input, spanIndex.byType.get(type)?.length ?? 0);

@@ -143,7 +143,7 @@ function activeFsContext(): ActiveFsContext | undefined {
     return undefined;
   }
 
-  const session = activeFsSessions.get(context.traceId);
+  const session = activeFsSessions.get(context.sessionId);
   if (session === undefined) {
     return undefined;
   }
@@ -995,7 +995,7 @@ export const fsInterceptor: Interceptor = {
       return () => undefined;
     }
 
-    activeFsSessions.set(traceContext.traceId, {
+    activeFsSessions.set(traceContext.sessionId, {
       addSpan: context.addSpan
     });
     installFsPatches();
@@ -1008,7 +1008,7 @@ export const fsInterceptor: Interceptor = {
       }
 
       installed = false;
-      activeFsSessions.delete(traceContext.traceId);
+      activeFsSessions.delete(traceContext.sessionId);
       restoreFsPatchesIfIdle();
     };
   },

@@ -48,7 +48,7 @@ function activeTimerContext(): ActiveTimerContext | undefined {
     return undefined;
   }
 
-  const session = activeTimerSessions.get(context.traceId);
+  const session = activeTimerSessions.get(context.sessionId);
   if (session === undefined) {
     return undefined;
   }
@@ -505,7 +505,7 @@ export const timerInterceptor: Interceptor = {
       return () => undefined;
     }
 
-    activeTimerSessions.set(traceContext.traceId, {
+    activeTimerSessions.set(traceContext.sessionId, {
       addSpan: context.addSpan,
       timerIds: new Map<unknown, string>(),
       nextTimerSequence: 1
@@ -520,7 +520,7 @@ export const timerInterceptor: Interceptor = {
       }
 
       installed = false;
-      activeTimerSessions.delete(traceContext.traceId);
+      activeTimerSessions.delete(traceContext.sessionId);
       restoreTimerPatchesIfIdle();
     };
   },

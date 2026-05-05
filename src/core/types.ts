@@ -151,6 +151,8 @@ export interface ReplayOptions {
   readonly mode?: ReplayMode;
   /** Span types replayed when mode is partial. */
   readonly replayTypes?: readonly SpanType[];
+  /** Maximum replay execution time in milliseconds before stubs are cleaned up and replay aborts. */
+  readonly timeout?: number;
 }
 
 /** Replay strategy used to associate a runtime call with a recorded span. */

@@ -47,7 +47,7 @@ function activePerformanceContext(): ActivePerformanceContext | undefined {
     return undefined;
   }
 
-  const session = activePerformanceSessions.get(context.traceId);
+  const session = activePerformanceSessions.get(context.sessionId);
   if (session === undefined) {
     return undefined;
   }
@@ -430,7 +430,7 @@ export const performanceInterceptor: Interceptor = {
       return () => undefined;
     }
 
-    activePerformanceSessions.set(traceContext.traceId, {
+    activePerformanceSessions.set(traceContext.sessionId, {
       addSpan: context.addSpan
     });
     installPerformancePatches();
@@ -443,7 +443,7 @@ export const performanceInterceptor: Interceptor = {
       }
 
       installed = false;
-      activePerformanceSessions.delete(traceContext.traceId);
+      activePerformanceSessions.delete(traceContext.sessionId);
       restorePerformancePatchesIfIdle();
     };
   },

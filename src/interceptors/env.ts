@@ -34,7 +34,7 @@ function activeEnvContext(): ActiveEnvContext | undefined {
     return undefined;
   }
 
-  const session = activeEnvSessions.get(context.traceId);
+  const session = activeEnvSessions.get(context.sessionId);
   if (session === undefined) {
     return undefined;
   }
@@ -284,7 +284,7 @@ export const envInterceptor: Interceptor = {
       return () => undefined;
     }
 
-    activeEnvSessions.set(traceContext.traceId, {
+    activeEnvSessions.set(traceContext.sessionId, {
       addSpan: context.addSpan,
       shadowEnv: new Map<string, string | undefined>()
     });
@@ -298,7 +298,7 @@ export const envInterceptor: Interceptor = {
       }
 
       installed = false;
-      activeEnvSessions.delete(traceContext.traceId);
+      activeEnvSessions.delete(traceContext.sessionId);
       restoreEnvPatchIfIdle();
     };
   },

@@ -71,7 +71,7 @@ function activeQueueContext(): ActiveQueueContext | undefined {
     return undefined;
   }
 
-  const session = activeQueueSessions.get(context.traceId);
+  const session = activeQueueSessions.get(context.sessionId);
   if (session === undefined) {
     return undefined;
   }
@@ -397,7 +397,7 @@ export const queueInterceptor: Interceptor = {
       return noopTeardown;
     }
 
-    activeQueueSessions.set(traceContext.traceId, {
+    activeQueueSessions.set(traceContext.sessionId, {
       addSpan: context.addSpan
     });
 
@@ -409,7 +409,7 @@ export const queueInterceptor: Interceptor = {
       }
 
       installed = false;
-      activeQueueSessions.delete(traceContext.traceId);
+      activeQueueSessions.delete(traceContext.sessionId);
     };
   },
   isAvailable: (): boolean => true

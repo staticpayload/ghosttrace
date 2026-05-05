@@ -90,7 +90,7 @@ function activeFunctionContext(): ActiveFunctionContext | undefined {
     return undefined;
   }
 
-  const session = activeFunctionSessions.get(context.traceId);
+  const session = activeFunctionSessions.get(context.sessionId);
   if (session === undefined) {
     return undefined;
   }
@@ -241,7 +241,7 @@ export const functionInterceptor: Interceptor = {
       return noopTeardown;
     }
 
-    activeFunctionSessions.set(traceContext.traceId, {
+    activeFunctionSessions.set(traceContext.sessionId, {
       addSpan: context.addSpan
     });
 
@@ -253,7 +253,7 @@ export const functionInterceptor: Interceptor = {
       }
 
       installed = false;
-      activeFunctionSessions.delete(traceContext.traceId);
+      activeFunctionSessions.delete(traceContext.sessionId);
     };
   },
   isAvailable: (): boolean => true

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  ReplayExhaustedError,
   ReplayMismatchError,
   SpanType,
   TRACE_FORMAT_VERSION,
@@ -133,7 +134,7 @@ describe('ReplayStore', () => {
     const store = createReplayStore(trace([onlySpan]));
 
     expect(store.consumeSpan(SpanType.Http, 'fetch', { url: '/once' })?.span).toBe(onlySpan);
-    expect(() => store.consumeSpan(SpanType.Http, 'fetch', { url: '/once' })).toThrow(ReplayMismatchError);
+    expect(() => store.consumeSpan(SpanType.Http, 'fetch', { url: '/once' })).toThrow(ReplayExhaustedError);
     expect(() => createReplayStore(trace([])).consumeSpan(SpanType.Http, 'fetch', { url: '/missing' })).toThrow(
       ReplayMismatchError
     );

@@ -68,6 +68,13 @@ export interface SpanMatcher<TSpan extends Span = Span> {
   readonly match: (request: SpanMatchRequest) => SpanMatch<TSpan> | undefined;
 }
 
+interface InputDifference {
+  readonly path: string;
+  readonly kind: 'changed' | 'missing' | 'extra';
+  readonly expected?: unknown;
+  readonly actual?: unknown;
+}
+
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -101,6 +108,64 @@ function deepEqual(left: unknown, right: unknown): boolean {
   }
 
   return leftKeys.every((key, index) => key === rightKeys[index] && deepEqual(left[key], right[key]));
+}
+
+function inputDifferences(
+  expected: unknown,
+  actual: unknown,
+  path = '$',
+  differences: InputDifference[] = []
+): readonly InputDifference[] {
+  if (deepEqual(expected, actual)) {
+    return differences;
+  }
+
+  if (Array.isArray(expected) || Array.isArray(actual)) {
+    if (!Array.isArray(expected) || !Array.isArray(actual)) {
+      differences.push({ path, kind: 'changed', expected, actual });
+      return differences;
+    }
+
+    const maxLength = Math.max(expected.length, actual.length);
+    for (let index = 0; index < maxLength; index += 1) {
+      if (index >= expected.length) {
+        differences.push({ path: `${path}[${index}]`, kind: 'extra', actual: actual[index] });
+      } else if (index >= actual.length) {
+        differences.push({ path: `${path}[${index}]`, kind: 'missing', expected: expected[index] });
+      } else {
+        inputDifferences(expected[index], actual[index], `${path}[${index}]`, differences);
+      }
+    }
+
+    return differences;
+  }
+
+  if (isRecord(expected) || isRecord(actual)) {
+    if (!isRecord(expected) || !isRecord(actual)) {
+      differences.push({ path, kind: 'changed', expected, actual });
+      return differences;
+    }
+
+    const keys = new Set([...Object.keys(expected), ...Object.keys(actual)]);
+    for (const key of [...keys].sort()) {
+      const expectedHasKey = Object.prototype.hasOwnProperty.call(expected, key);
+      const actualHasKey = Object.prototype.hasOwnProperty.call(actual, key);
+      const childPath = `${path}.${key}`;
+
+      if (!expectedHasKey) {
+        differences.push({ path: childPath, kind: 'extra', actual: actual[key] });
+      } else if (!actualHasKey) {
+        differences.push({ path: childPath, kind: 'missing', expected: expected[key] });
+      } else {
+        inputDifferences(expected[key], actual[key], childPath, differences);
+      }
+    }
+
+    return differences;
+  }
+
+  differences.push({ path, kind: 'changed', expected, actual });
+  return differences;
 }
 
 function deserializeSpanInput(input: unknown): unknown {
@@ -296,6 +361,11 @@ function throwInputMismatch<TSpan extends Span>(
   request: SpanMatchRequest,
   traceId: string
 ): never {
+  const expectedInput = deserializeSpanInput(candidate.span.input);
+  const actualInput = request.input;
+  const expectedIdentity = recordedInputIdentity(request.type, request.name, candidate.span.input);
+  const actualIdentity = actualInputIdentity(request.type, request.name, request.input);
+
   throw new ReplayMismatchError(`Recorded span input did not match runtime input for ${request.type}:${request.name}`, {
     traceId,
     spanId: candidate.span.id,
@@ -303,9 +373,12 @@ function throwInputMismatch<TSpan extends Span>(
       spanType: request.type,
       name: request.name,
       sequence: request.sequence,
-      expectedInput: candidate.span.input,
-      expectedIdentity: recordedInputIdentity(request.type, request.name, candidate.span.input),
-      actualIdentity: actualInputIdentity(request.type, request.name, request.input)
+      expectedInput,
+      actualInput,
+      expectedSerializedInput: candidate.span.input,
+      expectedIdentity,
+      actualIdentity,
+      inputDiffs: inputDifferences(expectedIdentity ?? expectedInput, actualIdentity ?? actualInput)
     }
   });
 }
@@ -325,13 +398,18 @@ export function createSpanMatcher<TSpan extends Span>(options: SpanMatcherOption
         return toMatch(exact, request, 'exact');
       }
 
-      const inputMatched = firstInputMatch(
-        options.view.inputCandidates(request.type, request.name),
-        request,
-        options.view.isConsumed
-      );
+      const sameNameCandidates = options.view.inputCandidates(request.type, request.name);
+      const inputMatched = firstInputMatch(sameNameCandidates, request, options.view.isConsumed);
       if (inputMatched !== undefined) {
         return toMatch(inputMatched, request, 'input');
+      }
+
+      const sameNameSequential = firstUnconsumed(sameNameCandidates, options.view.isConsumed);
+      if (sameNameSequential !== undefined && !sequentialPolicy(request.type, options.mode)) {
+        throwInputMismatch(sameNameSequential, request, options.traceId);
+      }
+      if (sameNameCandidates.length > 0 && sameNameSequential === undefined) {
+        return undefined;
       }
 
       const sequential = firstUnconsumed(

@@ -91,7 +91,7 @@ function activeDbContext(): ActiveDbContext | undefined {
     return undefined;
   }
 
-  const session = activeDbSessions.get(context.traceId);
+  const session = activeDbSessions.get(context.sessionId);
   if (session === undefined) {
     return undefined;
   }
@@ -498,7 +498,7 @@ export const dbInterceptor: Interceptor = {
       return noopTeardown;
     }
 
-    activeDbSessions.set(traceContext.traceId, {
+    activeDbSessions.set(traceContext.sessionId, {
       addSpan: context.addSpan
     });
 
@@ -510,7 +510,7 @@ export const dbInterceptor: Interceptor = {
       }
 
       installed = false;
-      activeDbSessions.delete(traceContext.traceId);
+      activeDbSessions.delete(traceContext.sessionId);
     };
   },
   isAvailable: (): boolean => true

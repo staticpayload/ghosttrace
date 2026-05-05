@@ -1,4 +1,5 @@
 import * as fsPromises from 'node:fs/promises';
+import { clearTimeout as clearNativeTimeout, setTimeout as setNativeTimeout } from 'node:timers';
 import { createTraceContext, runWithTraceContext } from '../core/context.js';
 import { ReplayMismatchError, TraceValidationError } from '../core/errors.js';
 import {
@@ -39,8 +40,16 @@ const replayInterceptors: readonly ReplayInterceptorEntry[] = [
   { type: SpanType.Performance, interceptor: performanceInterceptor }
 ];
 
+let nextReplaySessionSequence = 1;
+
 function monotonicNow(): number {
   return typeof performance === 'object' && typeof performance.now === 'function' ? performance.now() : Date.now();
+}
+
+function nextReplaySessionId(traceId: string): string {
+  const sequence = nextReplaySessionSequence;
+  nextReplaySessionSequence += 1;
+  return `${traceId}:replay:${sequence}`;
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
@@ -186,6 +195,71 @@ function summarizeUnmatchedSpan(span: Span): Record<string, string> {
   };
 }
 
+function normalizeReplayTimeout(timeout: number | undefined): number | undefined {
+  if (timeout === undefined) {
+    return undefined;
+  }
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    throw new ReplayMismatchError('Replay timeout must be a positive finite number of milliseconds', {
+      code: 'GHOSTTRACE_REPLAY_TIMEOUT_INVALID',
+      context: { timeout }
+    });
+  }
+
+  return timeout;
+}
+
+function replayTimeoutError(trace: Trace, timeout: number): ReplayMismatchError {
+  return new ReplayMismatchError(`Replay timed out after ${timeout}ms`, {
+    code: 'GHOSTTRACE_REPLAY_TIMEOUT',
+    traceId: trace.id,
+    context: { timeout }
+  });
+}
+
+function executeWithReplayTimeout<TOutput>(
+  trace: Trace,
+  fn: TraceableFunction<TOutput>,
+  timeout: number | undefined
+): Promise<Awaited<TOutput>> {
+  if (timeout === undefined) {
+    return Promise.resolve().then(fn) as Promise<Awaited<TOutput>>;
+  }
+
+  return new Promise<Awaited<TOutput>>((resolve, reject) => {
+    let settled = false;
+    const timeoutHandle = setNativeTimeout(() => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      reject(replayTimeoutError(trace, timeout));
+    }, timeout);
+
+    (Promise.resolve().then(fn) as Promise<Awaited<TOutput>>).then(
+      (value) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        clearNativeTimeout(timeoutHandle);
+        resolve(value);
+      },
+      (error: unknown) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        clearNativeTimeout(timeoutHandle);
+        reject(error);
+      }
+    );
+  });
+}
+
 /** Replays deterministic side-effect spans against a trace object. */
 export async function replay<TOutput, TSpan extends Span = Span>(
   traceInput: Trace<TSpan> | string,
@@ -193,10 +267,12 @@ export async function replay<TOutput, TSpan extends Span = Span>(
   options: ReplayOptions = {}
 ): Promise<ReplayResult<Awaited<TOutput>, TSpan>> {
   const trace = typeof traceInput === 'string' ? await loadReplayTrace<TSpan>(traceInput) : traceInput;
+  const timeout = normalizeReplayTimeout(options.timeout);
 
   const replayStore = createReplayStore(trace, options);
   const context = createTraceContext({
     traceId: trace.id,
+    sessionId: nextReplaySessionId(trace.id),
     mode: 'replay',
     metadata: trace.metadata,
     replayStore
@@ -208,7 +284,7 @@ export async function replay<TOutput, TSpan extends Span = Span>(
     const teardowns = installReplayInterceptors(options);
 
     try {
-      output = await fn();
+      output = await executeWithReplayTimeout(trace, fn, timeout);
       if (replayStore.mode === 'strict') {
         const unmatchedSpans = replayStore.unmatchedSpans();
         if (unmatchedSpans.length > 0) {

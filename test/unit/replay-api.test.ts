@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  ReplayExhaustedError,
   ReplayMismatchError,
   SpanType,
   TraceValidationError,
@@ -66,7 +67,7 @@ describe('ghost.replay API and modes', () => {
 
         return 'extra';
       })
-    ).rejects.toBeInstanceOf(ReplayMismatchError);
+    ).rejects.toBeInstanceOf(ReplayExhaustedError);
 
     await expect(
       ghost.replay(trace, async () => {

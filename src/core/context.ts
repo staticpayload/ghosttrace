@@ -11,6 +11,8 @@ export type TraceContextMode = 'record' | 'replay';
 export interface CreateTraceContextOptions {
   /** Trace identifier for the active recording or replay session. */
   readonly traceId: string;
+  /** Unique runtime session identifier used to isolate overlapping executions of the same trace. */
+  readonly sessionId?: string;
   /** Active execution mode. Defaults to "record". */
   readonly mode?: TraceContextMode;
   /** Current parent span, or null for root operations. */
@@ -31,6 +33,8 @@ export interface CreateTraceContextOptions {
 export interface TraceContext {
   /** Trace identifier for the active recording or replay session. */
   readonly traceId: string;
+  /** Unique runtime session identifier used to isolate overlapping executions of the same trace. */
+  readonly sessionId: string;
   /** Active execution mode. */
   readonly mode: TraceContextMode;
   /** Current parent span, or null for root operations. */
@@ -61,9 +65,12 @@ function assertTraceId(traceId: string): void {
 /** Creates a trace context with isolated deterministic utilities for one trace. */
 export function createTraceContext(options: CreateTraceContextOptions): TraceContext {
   assertTraceId(options.traceId);
+  const sessionId = options.sessionId ?? options.traceId;
+  assertTraceId(sessionId);
 
   const context: TraceContext = {
     traceId: options.traceId,
+    sessionId,
     mode: options.mode ?? 'record',
     currentSpan: options.currentSpan ?? null,
     clock: options.clock ?? createVirtualClock(),
