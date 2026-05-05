@@ -139,6 +139,31 @@ describe('contract validation and versioning', () => {
     ]);
   });
 
+  it('requires checksums for current-format traces while still accepting migrated older traces without checksums', () => {
+    const currentWithoutChecksum = trace();
+
+    const currentResult = ghost.validateTrace(currentWithoutChecksum);
+
+    expect(currentResult.valid).toBe(false);
+    expect(currentResult.errors).toEqual([
+      expect.objectContaining({
+        code: 'TRACE_CHECKSUM_MISSING',
+        path: '$.checksum'
+      })
+    ]);
+
+    const checkedBaseline = withTraceChecksum(trace([span('span_0001')]));
+    expect(() => ghost.diff(checkedBaseline, currentWithoutChecksum)).toThrow(/current trace is invalid/i);
+    expect(() => ghost.diff(checkedBaseline, currentWithoutChecksum)).toThrow(/checksum/i);
+
+    const migratedResult = ghost.validateTrace(trace([span('span_0001')], { version: '1.0.0' }));
+    expect(migratedResult).toMatchObject({ valid: true, errors: [] });
+    expect(migratedResult.trace).toMatchObject({
+      version: TRACE_FORMAT_VERSION,
+      checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u)
+    });
+  });
+
   it('migrates v1 traces through v2 to the current format idempotently while preserving span order', () => {
     const v1 = trace([span('span_0001'), span('span_0002')], { version: '1.0.0' });
 

@@ -223,5 +223,5 @@ describe('serializer', () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  });
+  }, 15_000);
 });

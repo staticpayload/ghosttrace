@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { SpanType, createTrace, diff, ghost, type Span, type Trace } from '../../src/index.js';
+import { SpanType, createTrace, diff, ghost, withTraceChecksum, type Span, type Trace } from '../../src/index.js';
 
 function span(
   id: string,
@@ -25,12 +25,12 @@ function span(
 }
 
 function trace(spans: readonly Span[]): Trace {
-  return createTrace({
+  return withTraceChecksum(createTrace({
     id: 'trace_contract',
     name: 'contract',
     endTime: Math.max(1, spans.length),
     spans
-  });
+  }));
 }
 
 describe('contract diff engine', () => {
@@ -99,6 +99,54 @@ describe('contract diff engine', () => {
     const removed = result.changes.find((change) => change.type === 'removed');
     expect(added === undefined ? true : 'baseline' in added).toBe(false);
     expect(removed === undefined ? true : 'current' in removed).toBe(false);
+  });
+
+  it('detects regressions inside child spans on aligned parent spans', () => {
+    const baseline = trace([
+      span('span_0001', SpanType.Function, 'checkout', {
+        children: [
+          span('span_0002', SpanType.Http, 'POST /charge', {
+            parentId: 'span_0001',
+            output: { status: 200 }
+          })
+        ]
+      })
+    ]);
+    const current = trace([
+      span('span_1001', SpanType.Function, 'checkout', {
+        children: [
+          span('span_1002', SpanType.Http, 'POST /charge', {
+            parentId: 'span_1001',
+            output: { status: 500 }
+          }),
+          span('span_1003', SpanType.Db, 'write failed payment', {
+            parentId: 'span_1001'
+          })
+        ]
+      })
+    ]);
+
+    const result = diff(baseline, current);
+
+    expect(result.status).toBe('drift');
+    expect(result.changes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'changed',
+          spanPath: '$.spans[0]',
+          field: 'children[0].output.status',
+          baseline: 200,
+          current: 500
+        }),
+        expect.objectContaining({
+          type: 'changed',
+          spanPath: '$.spans[0]',
+          field: 'children[1]',
+          baseline: undefined,
+          current: expect.objectContaining({ type: SpanType.Db, name: 'write failed payment' })
+        })
+      ])
+    );
   });
 
   it('sets DiffResult status to identical, drift, or breaking from change severities', () => {

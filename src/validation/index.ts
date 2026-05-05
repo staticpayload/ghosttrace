@@ -1,6 +1,6 @@
 import * as fsPromises from 'node:fs/promises';
 import { TraceValidationError } from '../core/errors.js';
-import { SpanType, type Span, type Trace } from '../core/types.js';
+import { SpanType, TRACE_FORMAT_VERSION, type Span, type Trace } from '../core/types.js';
 import { computeTraceChecksum, isFormattedTraceChecksum, verifyTraceChecksum } from './checksum.js';
 import { migrateTraceVersion } from './migrations.js';
 
@@ -434,8 +434,20 @@ function validateTraceTiming(trace: Readonly<Record<string, unknown>>, issues: T
   }
 }
 
-function validateChecksumField(trace: Readonly<Record<string, unknown>>, issues: TraceValidationIssue[]): void {
+function validateChecksumField(
+  trace: Readonly<Record<string, unknown>>,
+  issues: TraceValidationIssue[],
+  options: { readonly required?: boolean } = {}
+): void {
   if (!hasOwnProperty(trace, 'checksum')) {
+    if (options.required === true) {
+      addError(
+        issues,
+        'TRACE_CHECKSUM_MISSING',
+        '$.checksum',
+        `$.checksum is required for GhostTrace format ${TRACE_FORMAT_VERSION} traces`
+      );
+    }
     return;
   }
 
@@ -517,20 +529,18 @@ function validateTraceObject<TSpan extends Span>(value: unknown): TraceValidatio
   validateRecordField(value, '$', 'metadata', issues);
   validateParentReferences(references, issues);
 
+  let migratedTrace: Trace<TSpan> | undefined;
   if (typeof value.version === 'string') {
-    migrateTraceVersion(value as unknown as Trace<TSpan>);
+    migratedTrace = migrateTraceVersion(value as unknown as Trace<TSpan>);
   }
 
-  validateChecksumField(value, issues);
+  validateChecksumField(value, issues, { required: value.version === TRACE_FORMAT_VERSION });
 
   if (issues.some((validationIssue) => validationIssue.severity === 'error')) {
     return validationResult(issues);
   }
 
-  return validationResult(
-    issues,
-    typeof value.version === 'string' ? migrateTraceVersion(value as unknown as Trace<TSpan>) : undefined
-  );
+  return validationResult(issues, migratedTrace);
 }
 
 function fileIssue(code: string, filePath: string, message: string, cause?: unknown): TraceValidationResult {

@@ -158,6 +158,7 @@ const COMPARED_SPAN_FIELDS = [
   'duration',
   'input',
   'output',
+  'children',
   'error',
   'metadata'
 ] as const satisfies readonly (keyof Span)[];
