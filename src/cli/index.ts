@@ -12,23 +12,31 @@ import {
   deserialize,
   diff,
   exportTrace,
+  generateFixtures,
+  generateMocks,
+  generateTests,
   replay,
   SpanType,
+  validateTrace,
   wrap,
   type DiffChange,
   type DiffOptions,
   type DiffResult,
+  type FixtureGenerationFormat,
   type GhostTraceConfig,
   type JsonExportMode,
   type MermaidExportMode,
+  type MockGenerationFormat,
   type RecordedTrace,
   type RecordOptions,
   type ReplayMode,
   type ReplayOptions,
   type SerializedJsonValue,
   type Span,
+  type TestGenerationFramework,
   type Trace,
   type TraceExportFormat,
+  type TraceValidationResult,
   type TraceableFunction
 } from '../index.js';
 import { loadValidatedTrace } from '../validation/index.js';
@@ -68,12 +76,20 @@ const DIFF_FAIL_ON_VALUES = ['breaking', 'drift', 'any', 'none'] as const;
 const EXPORT_FORMATS = ['json', 'markdown', 'mermaid', 'html'] as const satisfies readonly TraceExportFormat[];
 const JSON_EXPORT_MODES = ['pretty', 'compact'] as const satisfies readonly JsonExportMode[];
 const MERMAID_EXPORT_MODES = ['sequence', 'flowchart'] as const satisfies readonly MermaidExportMode[];
+const TOP_LEVEL_COMMANDS = ['init', 'record', 'replay', 'diff', 'export', 'inspect', 'generate'] as const;
+const GENERATE_SUBCOMMANDS = ['mocks', 'fixtures', 'tests'] as const;
+const MOCK_GENERATE_FRAMEWORKS = ['function', 'vitest', 'jest'] as const;
+const FIXTURE_GENERATE_FORMATS = ['json', 'typescript'] as const satisfies readonly FixtureGenerationFormat[];
+const TEST_GENERATE_FRAMEWORKS = ['vitest', 'jest'] as const satisfies readonly TestGenerationFramework[];
 
 type DetectedFramework = 'vitest' | 'jest' | 'node';
 type CliTargetFunction = (...args: unknown[]) => unknown;
 type DiffReportFormat = (typeof DIFF_FORMATS)[number];
 type DiffFailOn = (typeof DIFF_FAIL_ON_VALUES)[number];
 type ExportFormatterMode = JsonExportMode | MermaidExportMode;
+type GenerateSubcommand = (typeof GENERATE_SUBCOMMANDS)[number];
+type MockGenerateFramework = (typeof MOCK_GENERATE_FRAMEWORKS)[number];
+type GenerateFramework = MockGenerateFramework | FixtureGenerationFormat | TestGenerationFramework;
 
 interface CliErrorOptions {
   readonly exitImmediately?: boolean;
@@ -105,6 +121,17 @@ interface ExportCommandOptions {
   readonly format?: unknown;
   readonly output?: unknown;
   readonly mode?: unknown;
+}
+
+interface InspectCommandOptions {
+  readonly spans?: unknown;
+  readonly span?: unknown;
+  readonly validate?: unknown;
+}
+
+interface GenerateCommandOptions {
+  readonly framework?: unknown;
+  readonly output?: unknown;
 }
 
 interface PackageJsonLike {
@@ -186,6 +213,23 @@ export function createCli(): CAC {
       await runExportCommand(process.cwd(), tracePath, options);
     });
 
+  cli
+    .command('inspect [trace]', 'Inspect a GhostTrace trace file')
+    .option('--spans', 'List every span in the trace')
+    .option('--span <id>', 'Show full detail for a specific span ID')
+    .option('--validate', 'Validate trace schema and checksum integrity')
+    .action(async (tracePath: string | undefined, options: InspectCommandOptions): Promise<void> => {
+      await runInspectCommand(process.cwd(), tracePath, options);
+    });
+
+  cli
+    .command('generate [kind] [trace]', 'Generate mocks, fixtures, or replay tests from a trace')
+    .option('--framework <framework>', 'mocks: function/vitest/jest; fixtures: json/typescript; tests: vitest/jest')
+    .option('--output <dir>', 'Directory for generated files')
+    .action(async (kind: string | undefined, tracePath: string | undefined, options: GenerateCommandOptions): Promise<void> => {
+      await runGenerateCommand(process.cwd(), kind, tracePath, options);
+    });
+
   return cli;
 }
 
@@ -200,7 +244,7 @@ export async function runCli(argv: readonly string[] = process.argv): Promise<nu
   try {
     const parsed = cli.parse([...argv], { run: false });
     if (cli.matchedCommand === undefined && parsed.args.length > 0) {
-      throw new CliError(`Unknown command "${parsed.args[0]}". Run "ghost --help" for available commands.`);
+      throw new CliError(`Unknown command "${parsed.args[0]}". Available commands: ${TOP_LEVEL_COMMANDS.join(', ')}. Run "ghost --help" for usage.`);
     }
 
     const actionResult: unknown = cli.runMatchedCommand();
@@ -645,6 +689,118 @@ function parseExportModeOption(format: TraceExportFormat, value: unknown): Expor
   }
 
   throw new CliError(`--mode is only supported for json and mermaid exports, not ${format}`);
+}
+
+function parseSpanIdOption(value: unknown): string | undefined {
+  return requireString(value, '--span');
+}
+
+function isEnabledFlag(value: unknown): boolean {
+  return optionalOptionValue(value) === true;
+}
+
+function parseGenerateSubcommand(value: string | undefined): GenerateSubcommand {
+  if (value === undefined) {
+    throw new CliError('Usage: ghost generate <mocks|fixtures|tests> <trace> [--framework name] [--output dir]');
+  }
+  if (!GENERATE_SUBCOMMANDS.includes(value as GenerateSubcommand)) {
+    throw new CliError(`Unknown generate subcommand "${value}". Expected one of: ${GENERATE_SUBCOMMANDS.join(', ')}`);
+  }
+
+  return value as GenerateSubcommand;
+}
+
+function configMetadataString(config: GhostTraceConfig, key: string): string | undefined {
+  const value = config.metadata?.[key];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function defaultGenerateFramework(kind: GenerateSubcommand, config: GhostTraceConfig): string | undefined {
+  const explicitGenerateFramework = configMetadataString(config, 'generateFramework');
+  if (explicitGenerateFramework !== undefined) {
+    return explicitGenerateFramework;
+  }
+
+  if (kind === 'fixtures') {
+    return configMetadataString(config, 'fixtureFormat');
+  }
+
+  const detectedFramework = configMetadataString(config, 'framework');
+  if (kind === 'mocks') {
+    return detectedFramework === 'node' ? 'function' : detectedFramework;
+  }
+  if (detectedFramework === 'vitest' || detectedFramework === 'jest') {
+    return detectedFramework;
+  }
+
+  return undefined;
+}
+
+function parseGenerateFrameworkValue<const TFramework extends string>(
+  kind: GenerateSubcommand,
+  rawValue: unknown,
+  config: GhostTraceConfig,
+  validValues: readonly TFramework[],
+  defaultValue: TFramework
+): TFramework {
+  const explicitValue = requireString(rawValue, '--framework');
+  const candidate = explicitValue ?? defaultGenerateFramework(kind, config) ?? defaultValue;
+  if (!validValues.includes(candidate as TFramework)) {
+    throw new CliError(`--framework for ${kind} must be one of: ${validValues.join(', ')}`);
+  }
+
+  return candidate as TFramework;
+}
+
+function parseGenerateFramework(
+  kind: GenerateSubcommand,
+  rawValue: unknown,
+  config: GhostTraceConfig
+): GenerateFramework {
+  if (kind === 'mocks') {
+    return parseGenerateFrameworkValue(kind, rawValue, config, MOCK_GENERATE_FRAMEWORKS, 'function');
+  }
+  if (kind === 'fixtures') {
+    return parseGenerateFrameworkValue(kind, rawValue, config, FIXTURE_GENERATE_FORMATS, 'json');
+  }
+
+  return parseGenerateFrameworkValue(kind, rawValue, config, TEST_GENERATE_FRAMEWORKS, 'vitest');
+}
+
+function mockFormatFromFramework(framework: GenerateFramework): MockGenerationFormat {
+  if (framework === 'vitest') {
+    return 'vitest-mock';
+  }
+  if (framework === 'jest') {
+    return 'jest-mock';
+  }
+
+  return 'function';
+}
+
+function outputDirectoryFromOptions(cwd: string, config: GhostTraceConfig, value: unknown): string | undefined {
+  const output = requireString(value, '--output');
+  if (output !== undefined) {
+    return resolve(cwd, output);
+  }
+  if (config.traceDir !== undefined) {
+    return resolve(cwd, config.traceDir);
+  }
+
+  return undefined;
+}
+
+function generatedFileBaseName(trace: Trace): string {
+  const sanitized = trace.name
+    .normalize('NFKD')
+    .toLowerCase()
+    .replace(/[\u0300-\u036f]/gu, '')
+    .replace(/[^a-z0-9]+/gu, '-')
+    .replace(/^-+|-+$/gu, '')
+    .slice(0, 80)
+    .replace(/^-+|-+$/gu, '');
+
+  return sanitized.length === 0 ? 'trace' : sanitized;
 }
 
 function optionalStringArray(value: unknown, description: string): readonly string[] | undefined {
@@ -1130,6 +1286,200 @@ async function runExportCommand(
   }
 
   console.log(pc.green(`Exported trace to ${contentOrPath}`));
+}
+
+function spanTypeCounts(trace: Trace): ReadonlyMap<SpanType, number> {
+  const counts = new Map<SpanType, number>();
+
+  for (const span of trace.spans) {
+    counts.set(span.type, (counts.get(span.type) ?? 0) + 1);
+  }
+
+  return counts;
+}
+
+function renderTraceSummary(trace: Trace): string {
+  const counts = spanTypeCounts(trace);
+  const errorCount = trace.spans.filter((span) => span.error !== null).length;
+  const lines = [
+    'Trace summary',
+    `Name: ${trace.name}`,
+    `ID: ${trace.id}`,
+    `Version: ${trace.version}`,
+    `Duration: ${trace.duration}ms`,
+    `Spans: ${trace.spans.length}`,
+    `Errors: ${errorCount}`,
+    'Span types:'
+  ];
+
+  for (const spanType of Object.values(SpanType)) {
+    const count = counts.get(spanType);
+    if (count !== undefined) {
+      lines.push(`  ${spanType}: ${count}`);
+    }
+  }
+
+  return `${lines.join('\n')}\n`;
+}
+
+function spanStatus(span: Span): string {
+  return span.error === null ? 'ok' : `error:${span.error.name}`;
+}
+
+function renderSpanList(trace: Trace): string {
+  const lines = [
+    `Spans (${trace.spans.length})`,
+    ...trace.spans.map((span) => [
+      span.id,
+      span.type,
+      span.name,
+      `duration=${span.duration}ms`,
+      `parent=${span.parentId ?? '-'}`,
+      spanStatus(span)
+    ].join('  '))
+  ];
+
+  return `${lines.join('\n')}\n`;
+}
+
+function renderSpanDetail(span: Span): string {
+  return `Span detail\n${JSON.stringify(span, null, 2)}\n`;
+}
+
+function validationIssueLines(label: string, issues: TraceValidationResult['errors']): readonly string[] {
+  if (issues.length === 0) {
+    return [];
+  }
+
+  return [
+    `${label}:`,
+    ...issues.map((issue) => `  ${issue.code} ${issue.path}: ${issue.message}`)
+  ];
+}
+
+function renderValidationResult(tracePath: string, result: TraceValidationResult): string {
+  const lines = result.valid
+    ? [pc.green(`Trace valid: ${tracePath}`)]
+    : [pc.red(`Trace invalid: ${tracePath}`)];
+
+  if (result.trace !== undefined) {
+    lines.push(`Name: ${result.trace.name}`);
+    lines.push(`Spans: ${result.trace.spans.length}`);
+  }
+
+  lines.push(...validationIssueLines('Errors', result.errors));
+  lines.push(...validationIssueLines('Warnings', result.warnings));
+
+  return `${lines.join('\n')}\n`;
+}
+
+async function runInspectCommand(
+  cwd: string,
+  tracePath: string | undefined,
+  options: InspectCommandOptions
+): Promise<void> {
+  if (tracePath === undefined) {
+    throw new CliError('Usage: ghost inspect <trace> [--spans] [--span id] [--validate]');
+  }
+
+  const absoluteTracePath = resolve(cwd, tracePath);
+  if (isEnabledFlag(options.validate)) {
+    const validationResult = await validateTrace(absoluteTracePath);
+    process.stdout.write(renderValidationResult(tracePath, validationResult));
+    if (!validationResult.valid) {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  const trace = await loadValidatedTrace(absoluteTracePath, 'inspect');
+  const spanId = parseSpanIdOption(options.span);
+  if (spanId !== undefined) {
+    const matchedSpan = trace.spans.find((span) => span.id === spanId);
+    if (matchedSpan === undefined) {
+      throw new CliError(`Span not found: ${spanId}`);
+    }
+
+    process.stdout.write(renderSpanDetail(matchedSpan));
+    return;
+  }
+
+  process.stdout.write(isEnabledFlag(options.spans) ? renderSpanList(trace) : renderTraceSummary(trace));
+}
+
+async function writeGeneratedSingleFile(
+  outputDirectory: string | undefined,
+  fileName: string,
+  content: string,
+  kind: GenerateSubcommand
+): Promise<void> {
+  if (outputDirectory === undefined) {
+    process.stdout.write(content);
+    return;
+  }
+
+  const outputPath = join(outputDirectory, fileName);
+  await writeTextOutput(outputPath, content);
+  console.log(pc.green(`Generated ${kind} to ${outputPath}`));
+}
+
+async function writeGeneratedFileMap(
+  outputDirectory: string | undefined,
+  files: ReadonlyMap<string, string>
+): Promise<void> {
+  if (outputDirectory === undefined) {
+    process.stdout.write(`${JSON.stringify(Object.fromEntries(files), null, 2)}\n`);
+    return;
+  }
+
+  await mkdir(outputDirectory, { recursive: true });
+  for (const [relativePath, content] of files) {
+    await writeTextOutput(join(outputDirectory, relativePath), content);
+  }
+
+  console.log(pc.green(`Generated fixtures to ${outputDirectory}`));
+}
+
+async function runGenerateCommand(
+  cwd: string,
+  rawKind: string | undefined,
+  tracePath: string | undefined,
+  options: GenerateCommandOptions
+): Promise<void> {
+  const kind = parseGenerateSubcommand(rawKind);
+  if (tracePath === undefined) {
+    throw new CliError('Usage: ghost generate <mocks|fixtures|tests> <trace> [--framework name] [--output dir]');
+  }
+
+  const config = await loadConfig(cwd);
+  const framework = parseGenerateFramework(kind, options.framework, config);
+  const outputDirectory = outputDirectoryFromOptions(cwd, config, options.output);
+  const trace = await loadValidatedTrace(resolve(cwd, tracePath), 'generate');
+
+  if (kind === 'mocks') {
+    await writeGeneratedSingleFile(
+      outputDirectory,
+      'mocks.ts',
+      generateMocks(trace, { format: mockFormatFromFramework(framework) }),
+      kind
+    );
+    return;
+  }
+
+  if (kind === 'fixtures') {
+    await writeGeneratedFileMap(
+      outputDirectory,
+      generateFixtures(trace, { format: framework as FixtureGenerationFormat })
+    );
+    return;
+  }
+
+  await writeGeneratedSingleFile(
+    outputDirectory,
+    `${generatedFileBaseName(trace)}.test.ts`,
+    generateTests(trace, { framework: framework as TestGenerationFramework }),
+    kind
+  );
 }
 
 if (isDirectExecution()) {
