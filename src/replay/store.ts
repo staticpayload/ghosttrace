@@ -1,14 +1,22 @@
-import { ReplayExhaustedError, ReplayMismatchError } from '../core/errors.js';
-import { deserialize, serialize, type SerializedJsonValue } from '../core/serializer.js';
+import { ReplayMismatchError } from '../core/errors.js';
 import {
   SpanType,
-  type ReplayMatchStrategy,
   type ReplayMode,
   type ReplayOptions,
   type ReplaySpanMatch,
   type Span,
   type Trace
 } from '../core/types.js';
+import { createSpanMatcher, type IndexedReplaySpan, type SpanMatcherView } from './matcher.js';
+
+export {
+  createSpanMatcher,
+  type IndexedReplaySpan,
+  type SpanMatch,
+  type SpanMatcher,
+  type SpanMatcherOptions,
+  type SpanMatchRequest
+} from './matcher.js';
 
 const REPLAY_STORE_MARKER = Symbol.for('ghosttrace.replayStore');
 
@@ -16,11 +24,11 @@ const REPLAY_STORE_MARKER = Symbol.for('ghosttrace.replayStore');
 export interface ReplayConsumption<TSpan extends Span = Span> {
   /** Span consumed for the replayed runtime call. */
   readonly span: TSpan;
-  /** Zero-based call sequence for this span type/name key. */
+  /** Zero-based runtime call sequence for this span type/name key. */
   readonly sequence: number;
 }
 
-/** Minimal sequential replay store used by deterministic interceptors. */
+/** Indexed replay store used by deterministic replay interceptors. */
 export interface ReplayStore<TSpan extends Span = Span> {
   /** Marker used to safely identify GhostTrace replay stores across modules. */
   readonly [REPLAY_STORE_MARKER]: true;
@@ -28,205 +36,32 @@ export interface ReplayStore<TSpan extends Span = Span> {
   readonly mode: ReplayMode;
   /** Returns true when the supplied span type should be replayed. */
   readonly canReplay: (type: SpanType) => boolean;
-  /** Consumes the next recorded span for a type/name pair. */
+  /** Looks up a span by type/name sequence using the composite O(1) index. */
+  readonly getSpan: (type: SpanType, name: string, sequence: number) => TSpan | undefined;
+  /** Looks up a span by a prebuilt `type:name:sequence` composite key. */
+  readonly getSpanByCompositeKey: (key: string) => TSpan | undefined;
+  /** Looks up a span by chronological global sequence. */
+  readonly getSpanByGlobalSequence: (sequence: number) => TSpan | undefined;
+  /** Consumes the best recorded span for a runtime replay call. */
   readonly consumeSpan: (type: SpanType, name: string, input: unknown) => ReplayConsumption<TSpan> | undefined;
   /** Returns all spans matched so far in replay order. */
   readonly matchedSpans: () => readonly ReplaySpanMatch<TSpan>[];
 }
 
-function spanKey(type: SpanType, name: string): string {
+interface ReplayIndex<TSpan extends Span> {
+  readonly byCompositeKey: ReadonlyMap<string, IndexedReplaySpan<TSpan>>;
+  readonly byGlobalSequence: ReadonlyMap<number, IndexedReplaySpan<TSpan>>;
+  readonly byTypeName: ReadonlyMap<string, readonly IndexedReplaySpan<TSpan>[]>;
+  readonly byType: ReadonlyMap<SpanType, readonly IndexedReplaySpan<TSpan>[]>;
+}
+
+function typeNameKey(type: SpanType, name: string): string {
   return `${type}:${name}`;
 }
 
-function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function recordValue(value: unknown, key: string): unknown {
-  return isRecord(value) ? value[key] : undefined;
-}
-
-function deepEqual(left: unknown, right: unknown): boolean {
-  if (Object.is(left, right)) {
-    return true;
-  }
-
-  if (Array.isArray(left) || Array.isArray(right)) {
-    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
-      return false;
-    }
-
-    return left.every((item, index) => deepEqual(item, right[index]));
-  }
-
-  if (!isRecord(left) || !isRecord(right)) {
-    return false;
-  }
-
-  const leftKeys = Object.keys(left).sort();
-  const rightKeys = Object.keys(right).sort();
-
-  if (leftKeys.length !== rightKeys.length) {
-    return false;
-  }
-
-  return leftKeys.every((key, index) => key === rightKeys[index] && deepEqual(left[key], right[key]));
-}
-
-function deserializeSpanInput(input: unknown): unknown {
-  return deserialize(input as SerializedJsonValue);
-}
-
-function envInputIdentity(input: unknown): Record<string, unknown> | undefined {
-  const operation = recordValue(input, 'operation');
-  const key = recordValue(input, 'key');
-
-  if (typeof key !== 'string') {
-    return undefined;
-  }
-
-  const identity: Record<string, unknown> = { key };
-  if (typeof operation === 'string') {
-    identity.operation = operation;
-  }
-
-  return identity;
-}
-
-function timerSetInputIdentity(input: unknown): Record<string, unknown> | undefined {
-  const operation = recordValue(input, 'operation');
-  const delay = recordValue(input, 'delay');
-  const callbackName = recordValue(input, 'callbackName');
-
-  if (typeof operation !== 'string' || typeof delay !== 'number') {
-    return undefined;
-  }
-
-  const identity: Record<string, unknown> = {
-    operation,
-    delay
-  };
-
-  if (typeof callbackName === 'string') {
-    identity.callbackName = callbackName;
-  }
-
-  return identity;
-}
-
-function timerClearInputIdentity(input: unknown): Record<string, unknown> | undefined {
-  const operation = recordValue(input, 'operation');
-  const timerId = recordValue(input, 'timerId');
-
-  if (typeof operation !== 'string' || typeof timerId !== 'string') {
-    return undefined;
-  }
-
-  return {
-    operation,
-    timerId
-  };
-}
-
-function timerOperationInputIdentity(input: unknown): Record<string, unknown> | undefined {
-  const operation = recordValue(input, 'operation');
-
-  if (typeof operation !== 'string') {
-    return undefined;
-  }
-
-  return { operation };
-}
-
-function timerInputIdentity(name: string, input: unknown): Record<string, unknown> | undefined {
-  switch (name) {
-    case 'setTimeout':
-    case 'setInterval':
-      return timerSetInputIdentity(input);
-    case 'clearTimeout':
-    case 'clearInterval':
-      return timerClearInputIdentity(input);
-    default:
-      return timerOperationInputIdentity(input);
-  }
-}
-
-function copyDefinedRecordValue(target: Record<string, unknown>, source: unknown, key: string): void {
-  const value = recordValue(source, key);
-
-  if (value !== undefined) {
-    target[key] = value;
-  }
-}
-
-function fsInputIdentity(input: unknown): Record<string, unknown> | undefined {
-  const operation = recordValue(input, 'operation');
-  const api = recordValue(input, 'api');
-
-  if (typeof operation !== 'string' || typeof api !== 'string') {
-    return undefined;
-  }
-
-  const identity: Record<string, unknown> = {
-    operation,
-    api
-  };
-
-  if (operation === 'rename') {
-    copyDefinedRecordValue(identity, input, 'oldPath');
-    copyDefinedRecordValue(identity, input, 'newPath');
-    return identity;
-  }
-
-  copyDefinedRecordValue(identity, input, 'path');
-  copyDefinedRecordValue(identity, input, 'options');
-  copyDefinedRecordValue(identity, input, 'mode');
-  return identity;
-}
-
-function recordedInputIdentity(type: SpanType, name: string, input: unknown): unknown | undefined {
-  switch (type) {
-    case SpanType.Env:
-      return envInputIdentity(deserializeSpanInput(input));
-    case SpanType.Timer:
-      return timerInputIdentity(name, deserializeSpanInput(input));
-    case SpanType.Random:
-      return undefined;
-    case SpanType.Fs:
-      return fsInputIdentity(deserializeSpanInput(input));
-    default:
-      return input;
-  }
-}
-
-function actualInputIdentity(type: SpanType, name: string, input: unknown): unknown | undefined {
-  switch (type) {
-    case SpanType.Env:
-      return envInputIdentity(input);
-    case SpanType.Timer:
-      return timerInputIdentity(name, input);
-    case SpanType.Random:
-      return undefined;
-    case SpanType.Fs:
-      return fsInputIdentity(input);
-    default:
-      return serialize(input);
-  }
-}
-
-function inputMatches(type: SpanType, name: string, span: Span, actualInput: unknown): boolean {
-  const recordedIdentity = recordedInputIdentity(type, name, span.input);
-  const actualIdentity = actualInputIdentity(type, name, actualInput);
-
-  if (recordedIdentity === undefined || actualIdentity === undefined) {
-    return false;
-  }
-
-  return deepEqual(recordedIdentity, actualIdentity);
-}
-
-function allowsSequentialFallback(type: SpanType, mode: ReplayMode): boolean {
-  return type === SpanType.Random || mode !== 'strict';
+/** Builds the canonical composite replay key for type/name sequence lookups. */
+export function replayCompositeKey(type: SpanType, name: string, sequence: number): string {
+  return `${type}:${name}:${sequence}`;
 }
 
 function replayMode(options: ReplayOptions): ReplayMode {
@@ -241,157 +76,135 @@ function replayTypes(options: ReplayOptions, mode: ReplayMode): ReadonlySet<Span
   return new Set(options.replayTypes ?? []);
 }
 
-function indexTraceSpans<TSpan extends Span>(trace: Trace<TSpan>): Map<string, TSpan[]> {
-  const spansByKey = new Map<string, TSpan[]>();
-
-  for (const span of trace.spans) {
-    const key = spanKey(span.type, span.name);
-    const spans = spansByKey.get(key) ?? [];
-    spans.push(span);
-    spansByKey.set(key, spans);
-  }
-
-  return spansByKey;
+function appendIndexedSpan<TKey, TSpan extends Span>(
+  map: Map<TKey, IndexedReplaySpan<TSpan>[]>,
+  key: TKey,
+  indexedSpan: IndexedReplaySpan<TSpan>
+): void {
+  const spans = map.get(key) ?? [];
+  spans.push(indexedSpan);
+  map.set(key, spans);
 }
 
-/** Creates a sequential replay store over a trace's chronological top-level span list. */
+function indexTraceSpans<TSpan extends Span>(trace: Trace<TSpan>): ReplayIndex<TSpan> {
+  const byCompositeKey = new Map<string, IndexedReplaySpan<TSpan>>();
+  const byGlobalSequence = new Map<number, IndexedReplaySpan<TSpan>>();
+  const byTypeName = new Map<string, IndexedReplaySpan<TSpan>[]>();
+  const byType = new Map<SpanType, IndexedReplaySpan<TSpan>[]>();
+  const sequenceByTypeName = new Map<string, number>();
+
+  for (const [globalSequence, span] of trace.spans.entries()) {
+    const key = typeNameKey(span.type, span.name);
+    const keySequence = sequenceByTypeName.get(key) ?? 0;
+    const compositeKey = replayCompositeKey(span.type, span.name, keySequence);
+    const indexedSpan: IndexedReplaySpan<TSpan> = {
+      span,
+      keySequence,
+      globalSequence,
+      compositeKey
+    };
+
+    sequenceByTypeName.set(key, keySequence + 1);
+    byCompositeKey.set(compositeKey, indexedSpan);
+    byGlobalSequence.set(globalSequence, indexedSpan);
+    appendIndexedSpan(byTypeName, key, indexedSpan);
+    appendIndexedSpan(byType, span.type, indexedSpan);
+  }
+
+  return {
+    byCompositeKey,
+    byGlobalSequence,
+    byTypeName,
+    byType
+  };
+}
+
+function replayMissError(
+  trace: Trace,
+  type: SpanType,
+  name: string,
+  sequence: number,
+  input: unknown,
+  availableSpanCount: number
+): ReplayMismatchError {
+  return new ReplayMismatchError(`No recorded span matched runtime call for ${type}:${name}`, {
+    traceId: trace.id,
+    context: {
+      spanType: type,
+      name,
+      sequence,
+      input,
+      availableSpanCount
+    }
+  });
+}
+
+/** Creates an indexed replay store over a trace's chronological span list. */
 export function createReplayStore<TSpan extends Span>(
   trace: Trace<TSpan>,
   options: ReplayOptions = {}
 ): ReplayStore<TSpan> {
   const mode = replayMode(options);
   const selectedTypes = replayTypes(options, mode);
-  const spansByKey = indexTraceSpans(trace);
+  const spanIndex = indexTraceSpans(trace);
   const runtimeSequenceByKey = new Map<string, number>();
-  const consumedIndexesByKey = new Map<string, Set<number>>();
+  const consumedGlobalSequences = new Set<number>();
   const matches: ReplaySpanMatch<TSpan>[] = [];
 
   const canReplay = (type: SpanType): boolean => selectedTypes === null || selectedTypes.has(type);
 
-  const isConsumed = (key: string, index: number): boolean => consumedIndexesByKey.get(key)?.has(index) ?? false;
+  const getSpanByCompositeKey = (key: string): TSpan | undefined => spanIndex.byCompositeKey.get(key)?.span;
 
-  const markConsumed = (key: string, index: number): void => {
-    const consumedIndexes = consumedIndexesByKey.get(key) ?? new Set<number>();
-    consumedIndexes.add(index);
-    consumedIndexesByKey.set(key, consumedIndexes);
+  const getSpan = (type: SpanType, name: string, sequence: number): TSpan | undefined =>
+    getSpanByCompositeKey(replayCompositeKey(type, name, sequence));
+
+  const getSpanByGlobalSequence = (sequence: number): TSpan | undefined =>
+    spanIndex.byGlobalSequence.get(sequence)?.span;
+
+  const matcherView: SpanMatcherView<TSpan> = {
+    exactCandidate: (type, name, sequence) => spanIndex.byCompositeKey.get(replayCompositeKey(type, name, sequence)),
+    inputCandidates: (type, name) => spanIndex.byTypeName.get(typeNameKey(type, name)) ?? [],
+    sequentialCandidates: (type) => spanIndex.byType.get(type) ?? [],
+    isConsumed: (candidate) => consumedGlobalSequences.has(candidate.globalSequence)
   };
-
-  const firstUnconsumedIndex = (key: string, spans: readonly TSpan[]): number | undefined => {
-    for (let index = 0; index < spans.length; index += 1) {
-      if (!isConsumed(key, index)) {
-        return index;
-      }
-    }
-
-    return undefined;
-  };
-
-  const inputMatchedIndex = (
-    key: string,
-    spans: readonly TSpan[],
-    type: SpanType,
-    name: string,
-    input: unknown
-  ): number | undefined => {
-    for (let index = 0; index < spans.length; index += 1) {
-      if (!isConsumed(key, index) && inputMatches(type, name, spans[index] as Span, input)) {
-        return index;
-      }
-    }
-
-    return undefined;
-  };
-
-  const selectSpan = (
-    key: string,
-    spans: readonly TSpan[],
-    sequence: number,
-    type: SpanType,
-    name: string,
-    input: unknown
-  ): { readonly index: number; readonly strategy: ReplayMatchStrategy } | undefined => {
-    const sequenceSpan = spans[sequence];
-    if (sequenceSpan !== undefined && !isConsumed(key, sequence) && inputMatches(type, name, sequenceSpan, input)) {
-      return {
-        index: sequence,
-        strategy: 'exact'
-      };
-    }
-
-    const matchedByInput = inputMatchedIndex(key, spans, type, name, input);
-    if (matchedByInput !== undefined) {
-      return {
-        index: matchedByInput,
-        strategy: 'input'
-      };
-    }
-
-    const sequentialIndex = firstUnconsumedIndex(key, spans);
-    if (sequentialIndex !== undefined && !allowsSequentialFallback(type, mode)) {
-      const nextSpan = spans[sequentialIndex];
-      if (nextSpan === undefined) {
-        return undefined;
-      }
-
-      throw new ReplayMismatchError(`Recorded span input did not match runtime input for ${type}:${name}`, {
-        traceId: trace.id,
-        spanId: nextSpan.id,
-        context: {
-          spanType: type,
-          name,
-          sequence,
-          expectedInput: nextSpan.input,
-          expectedIdentity: recordedInputIdentity(type, name, nextSpan.input),
-          actualIdentity: actualInputIdentity(type, name, input)
-        }
-      });
-    }
-
-    return sequentialIndex === undefined
-      ? undefined
-      : {
-          index: sequentialIndex,
-          strategy: 'sequential'
-        };
-  };
+  const matcher = createSpanMatcher({
+    traceId: trace.id,
+    mode,
+    view: matcherView
+  });
 
   const consumeSpan = (type: SpanType, name: string, input: unknown): ReplayConsumption<TSpan> | undefined => {
     if (!canReplay(type)) {
       return undefined;
     }
 
-    const key = spanKey(type, name);
+    const key = typeNameKey(type, name);
     const sequence = runtimeSequenceByKey.get(key) ?? 0;
-    const spans = spansByKey.get(key) ?? [];
-    const selectedSpan = selectSpan(key, spans, sequence, type, name, input);
+    const selectedSpan = matcher.match({
+      type,
+      name,
+      sequence,
+      input
+    });
 
     if (selectedSpan === undefined) {
       if (mode === 'lenient') {
         return undefined;
       }
 
-      throw new ReplayExhaustedError(`No recorded span remains for ${type}:${name}`, {
-        traceId: trace.id,
-        context: {
-          spanType: type,
-          name,
-          sequence,
-          input
-        }
-      });
+      throw replayMissError(trace, type, name, sequence, input, spanIndex.byType.get(type)?.length ?? 0);
     }
 
-    const span = spans[selectedSpan.index] as TSpan;
     runtimeSequenceByKey.set(key, sequence + 1);
-    markConsumed(key, selectedSpan.index);
+    consumedGlobalSequences.add(selectedSpan.globalSequence);
     matches.push({
-      span,
+      span: selectedSpan.span,
       strategy: selectedSpan.strategy,
       sequence
     });
 
     return {
-      span,
+      span: selectedSpan.span,
       sequence
     };
   };
@@ -400,8 +213,11 @@ export function createReplayStore<TSpan extends Span>(
     [REPLAY_STORE_MARKER]: true,
     mode,
     canReplay,
+    getSpan,
+    getSpanByCompositeKey,
+    getSpanByGlobalSequence,
     consumeSpan,
-    matchedSpans: () => [...matches]
+    matchedSpans: (): readonly ReplaySpanMatch<TSpan>[] => [...matches]
   };
 }
 
