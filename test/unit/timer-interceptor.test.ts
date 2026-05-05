@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { SpanType, ghost, type Span } from '../../src/index.js';
+import { ReplayMismatchError, SpanType, ghost, type Span } from '../../src/index.js';
 
 function spansOfType(spans: readonly Span[], type: SpanType): readonly Span[] {
   return spans.filter((span) => span.type === type);
@@ -187,5 +187,51 @@ describe('timer interceptor', () => {
       'firstTimerCallback'
     ]);
     expect(replayed.spansMatched.map((match) => match.strategy)).toEqual(['input', 'input']);
+  });
+
+  it('throws ReplayMismatchError for an unmatched timer delay in strict replay mode', async () => {
+    function strictDelayCallback(): void {
+      // Intentionally empty; strict replay should fail before this callback is invoked.
+    }
+
+    const trace = await ghost.record(
+      'timer-strict-delay-mismatch',
+      () => {
+        const timeout = setTimeout(strictDelayCallback, 60_003);
+        pendingTimerHandles.push(timeout);
+        clearTimeout(timeout);
+
+        return 'recorded';
+      },
+      { interceptors: ['timer'] }
+    );
+
+    await expect(
+      ghost.replay(
+        trace,
+        () => {
+          setTimeout(strictDelayCallback, 60_004);
+          return 'replayed';
+        },
+        { mode: 'strict' }
+      )
+    ).rejects.toMatchObject({
+      name: ReplayMismatchError.name,
+      code: 'GHOSTTRACE_REPLAY_MISMATCH',
+      context: {
+        spanType: SpanType.Timer,
+        name: 'setTimeout',
+        expectedIdentity: {
+          operation: 'setTimeout',
+          delay: 60_003,
+          callbackName: 'strictDelayCallback'
+        },
+        actualIdentity: {
+          operation: 'setTimeout',
+          delay: 60_004,
+          callbackName: 'strictDelayCallback'
+        }
+      }
+    });
   });
 });

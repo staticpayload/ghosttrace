@@ -1,4 +1,4 @@
-import { ReplayExhaustedError } from '../core/errors.js';
+import { ReplayExhaustedError, ReplayMismatchError } from '../core/errors.js';
 import { deserialize, serialize, type SerializedJsonValue } from '../core/serializer.js';
 import {
   SpanType,
@@ -151,6 +151,39 @@ function timerInputIdentity(name: string, input: unknown): Record<string, unknow
   }
 }
 
+function copyDefinedRecordValue(target: Record<string, unknown>, source: unknown, key: string): void {
+  const value = recordValue(source, key);
+
+  if (value !== undefined) {
+    target[key] = value;
+  }
+}
+
+function fsInputIdentity(input: unknown): Record<string, unknown> | undefined {
+  const operation = recordValue(input, 'operation');
+  const api = recordValue(input, 'api');
+
+  if (typeof operation !== 'string' || typeof api !== 'string') {
+    return undefined;
+  }
+
+  const identity: Record<string, unknown> = {
+    operation,
+    api
+  };
+
+  if (operation === 'rename') {
+    copyDefinedRecordValue(identity, input, 'oldPath');
+    copyDefinedRecordValue(identity, input, 'newPath');
+    return identity;
+  }
+
+  copyDefinedRecordValue(identity, input, 'path');
+  copyDefinedRecordValue(identity, input, 'options');
+  copyDefinedRecordValue(identity, input, 'mode');
+  return identity;
+}
+
 function recordedInputIdentity(type: SpanType, name: string, input: unknown): unknown | undefined {
   switch (type) {
     case SpanType.Env:
@@ -159,6 +192,8 @@ function recordedInputIdentity(type: SpanType, name: string, input: unknown): un
       return timerInputIdentity(name, deserializeSpanInput(input));
     case SpanType.Random:
       return undefined;
+    case SpanType.Fs:
+      return fsInputIdentity(deserializeSpanInput(input));
     default:
       return input;
   }
@@ -172,6 +207,8 @@ function actualInputIdentity(type: SpanType, name: string, input: unknown): unkn
       return timerInputIdentity(name, input);
     case SpanType.Random:
       return undefined;
+    case SpanType.Fs:
+      return fsInputIdentity(input);
     default:
       return serialize(input);
   }
@@ -186,6 +223,10 @@ function inputMatches(type: SpanType, name: string, span: Span, actualInput: unk
   }
 
   return deepEqual(recordedIdentity, actualIdentity);
+}
+
+function allowsSequentialFallback(type: SpanType, mode: ReplayMode): boolean {
+  return type === SpanType.Random || mode !== 'strict';
 }
 
 function replayMode(options: ReplayOptions): ReplayMode {
@@ -286,6 +327,26 @@ export function createReplayStore<TSpan extends Span>(
     }
 
     const sequentialIndex = firstUnconsumedIndex(key, spans);
+    if (sequentialIndex !== undefined && !allowsSequentialFallback(type, mode)) {
+      const nextSpan = spans[sequentialIndex];
+      if (nextSpan === undefined) {
+        return undefined;
+      }
+
+      throw new ReplayMismatchError(`Recorded span input did not match runtime input for ${type}:${name}`, {
+        traceId: trace.id,
+        spanId: nextSpan.id,
+        context: {
+          spanType: type,
+          name,
+          sequence,
+          expectedInput: nextSpan.input,
+          expectedIdentity: recordedInputIdentity(type, name, nextSpan.input),
+          actualIdentity: actualInputIdentity(type, name, input)
+        }
+      });
+    }
+
     return sequentialIndex === undefined
       ? undefined
       : {

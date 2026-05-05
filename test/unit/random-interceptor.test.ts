@@ -32,6 +32,7 @@ describe('random interceptor', () => {
     expect(replayed.output).toEqual(expectedSequence);
     expect(replayed.spansMatched).toHaveLength(1000);
     expect(replayed.spansMatched.every((match) => match.span.name === 'Math.random')).toBe(true);
+    expect(replayed.spansMatched.every((match) => match.strategy === 'sequential')).toBe(true);
   });
 
   it('records and replays crypto.getRandomValues byte-for-byte while returning the same typed array', async () => {

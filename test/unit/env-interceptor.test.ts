@@ -1,10 +1,18 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { SpanType, deserialize, ghost, type SerializedJsonValue, type Span } from '../../src/index.js';
+import { ReplayMismatchError, SpanType, deserialize, ghost, type SerializedJsonValue, type Span } from '../../src/index.js';
 
 const ENV_KEY = 'GHOSTTRACE_ENV_INTERCEPTOR_TEST_VALUE';
 const ENV_REORDERED_FIRST_KEY = 'GHOSTTRACE_ENV_INTERCEPTOR_REORDERED_FIRST';
 const ENV_REORDERED_SECOND_KEY = 'GHOSTTRACE_ENV_INTERCEPTOR_REORDERED_SECOND';
-const envKeys = [ENV_KEY, ENV_REORDERED_FIRST_KEY, ENV_REORDERED_SECOND_KEY] as const;
+const ENV_STRICT_RECORDED_KEY = 'GHOSTTRACE_ENV_INTERCEPTOR_STRICT_RECORDED';
+const ENV_STRICT_ACTUAL_KEY = 'GHOSTTRACE_ENV_INTERCEPTOR_STRICT_ACTUAL';
+const envKeys = [
+  ENV_KEY,
+  ENV_REORDERED_FIRST_KEY,
+  ENV_REORDERED_SECOND_KEY,
+  ENV_STRICT_RECORDED_KEY,
+  ENV_STRICT_ACTUAL_KEY
+] as const;
 const originalValues = new Map<string, string | undefined>(envKeys.map((key) => [key, process.env[key]]));
 
 function envSpans(spans: readonly Span[]): readonly Span[] {
@@ -177,5 +185,58 @@ describe('environment interceptor', () => {
       ENV_REORDERED_FIRST_KEY
     ]);
     expect(replayed.spansMatched.map((match) => match.strategy)).toEqual(['input', 'input']);
+  });
+
+  it('throws ReplayMismatchError for an unmatched env key in strict replay mode', async () => {
+    process.env[ENV_STRICT_RECORDED_KEY] = 'recorded-strict-env';
+    process.env[ENV_STRICT_ACTUAL_KEY] = 'actual-strict-env';
+
+    const trace = await ghost.record('env-strict-key-mismatch', () => process.env[ENV_STRICT_RECORDED_KEY], {
+      interceptors: ['env']
+    });
+
+    await expect(
+      ghost.replay(trace, () => process.env[ENV_STRICT_ACTUAL_KEY], {
+        mode: 'strict'
+      })
+    ).rejects.toMatchObject({
+      name: ReplayMismatchError.name,
+      code: 'GHOSTTRACE_REPLAY_MISMATCH',
+      context: {
+        spanType: SpanType.Env,
+        name: 'process.env.get',
+        expectedIdentity: {
+          operation: 'get',
+          key: ENV_STRICT_RECORDED_KEY
+        },
+        actualIdentity: {
+          operation: 'get',
+          key: ENV_STRICT_ACTUAL_KEY
+        }
+      }
+    });
+  });
+
+  it('falls back sequentially for an unmatched env key in lenient replay mode', async () => {
+    process.env[ENV_STRICT_RECORDED_KEY] = 'recorded-lenient-env';
+    process.env[ENV_STRICT_ACTUAL_KEY] = 'actual-lenient-env';
+
+    const trace = await ghost.record('env-lenient-key-mismatch', () => process.env[ENV_STRICT_RECORDED_KEY], {
+      interceptors: ['env']
+    });
+
+    const replayed = await ghost.replay(
+      trace,
+      () => ({
+        value: process.env[ENV_STRICT_ACTUAL_KEY]
+      }),
+      {
+        mode: 'lenient'
+      }
+    );
+
+    expect(replayed.output).toEqual({ value: 'recorded-lenient-env' });
+    expect(replayed.spansMatched.map((match) => spanInputKey(match.span))).toEqual([ENV_STRICT_RECORDED_KEY]);
+    expect(replayed.spansMatched.map((match) => match.strategy)).toEqual(['sequential']);
   });
 });
