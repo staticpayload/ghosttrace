@@ -1,4 +1,5 @@
 import { GhostTraceError } from './core/errors.js';
+import { deserialize, serialize, stringifySerialized, writeSerializedJson } from './core/serializer.js';
 import {
   TRACE_FORMAT_VERSION,
   SpanType,
@@ -17,6 +18,18 @@ import { VERSION } from './version.js';
 export { VERSION } from './version.js';
 export { GhostTraceError } from './core/errors.js';
 export type { GhostTraceErrorOptions } from './core/errors.js';
+export {
+  deserialize,
+  serialize,
+  serializeToJsonChunks,
+  stringifySerialized,
+  writeSerializedJson,
+  type SerializedJsonObject,
+  type SerializedJsonPrimitive,
+  type SerializedJsonValue,
+  type SerializeOptions,
+  type WriteSerializedJsonOptions
+} from './core/serializer.js';
 export {
   TRACE_FORMAT_VERSION,
   SpanType,
@@ -149,6 +162,10 @@ export const ghost = {
   createTracer,
   record,
   replay,
+  serialize,
+  deserialize,
+  stringifySerialized,
+  writeSerializedJson,
   wrap,
   wrapModule
 } as const;
