@@ -41,7 +41,17 @@ import {
 } from './redaction/index.js';
 import { record, registerInterceptor } from './recorder/index.js';
 import { replay as replayTrace } from './replay/index.js';
-import { diff } from './contract/diff.js';
+import { diff as diffTraces, type DiffOptions, type DiffResult } from './contract/diff.js';
+import {
+  computeTraceChecksum,
+  loadValidatedTrace,
+  migrateTraceVersion,
+  validateTrace as validateTraceInput,
+  validateTraceForUse,
+  verifyTraceChecksum,
+  withTraceChecksum,
+  type TraceValidationResult
+} from './validation/index.js';
 import { VERSION } from './version.js';
 
 export { VERSION } from './version.js';
@@ -153,7 +163,6 @@ export type {
   RedactionRegexRule
 } from './redaction/index.js';
 export { record, registerInterceptor } from './recorder/index.js';
-export { diff } from './contract/diff.js';
 export type {
   AddedSpanChange,
   ChangedFieldChange,
@@ -169,6 +178,18 @@ export type {
   DiffWarning,
   RemovedSpanChange
 } from './contract/diff.js';
+export {
+  computeTraceChecksum,
+  migrateTraceVersion,
+  verifyTraceChecksum,
+  withTraceChecksum
+} from './validation/index.js';
+export type {
+  ChecksummedTrace,
+  TraceValidationIssue,
+  TraceValidationIssueSeverity,
+  TraceValidationResult
+} from './validation/index.js';
 
 function cloneMetadata(metadata: TraceMetadata | undefined): TraceMetadata {
   return metadata === undefined ? {} : { ...metadata };
@@ -261,6 +282,41 @@ export async function replay<TOutput, TSpan extends Span = Span>(
   return replayTrace(trace, fn, options);
 }
 
+/** Validates a trace file path and returns machine-readable issues. */
+export function validateTrace(path: string): Promise<TraceValidationResult>;
+/** Validates an in-memory trace-like object and returns machine-readable issues. */
+export function validateTrace<TSpan extends Span>(trace: Trace<TSpan> | unknown): TraceValidationResult<TSpan>;
+export function validateTrace<TSpan extends Span>(
+  input: Trace<TSpan> | string | unknown
+): TraceValidationResult<TSpan> | Promise<TraceValidationResult> {
+  return validateTraceInput(input);
+}
+
+/** Compares two validated traces using the contract diff engine. */
+export function diff(baseline: Trace, current: Trace, options?: DiffOptions): DiffResult;
+/** Compares trace file paths or mixed path/object inputs using the contract diff engine. */
+export function diff(baseline: string, current: Trace | string, options?: DiffOptions): Promise<DiffResult>;
+/** Compares trace file paths or mixed path/object inputs using the contract diff engine. */
+export function diff(baseline: Trace, current: string, options?: DiffOptions): Promise<DiffResult>;
+export function diff(
+  baseline: Trace | string,
+  current: Trace | string,
+  options: DiffOptions = {}
+): DiffResult | Promise<DiffResult> {
+  if (typeof baseline === 'string' || typeof current === 'string') {
+    return Promise.all([
+      loadValidatedTrace(baseline, 'baseline'),
+      loadValidatedTrace(current, 'current')
+    ]).then(([baselineTrace, currentTrace]) => diffTraces(baselineTrace, currentTrace, options));
+  }
+
+  return diffTraces(
+    validateTraceForUse(baseline, 'baseline'),
+    validateTraceForUse(current, 'current'),
+    options
+  );
+}
+
 /** Returns an isolated GhostTrace API instance with captured configuration. */
 export function createTracer(config: GhostTraceConfig = {}): Tracer {
   const normalizedConfig = defineConfig(config);
@@ -297,6 +353,11 @@ export const ghost = {
   record,
   replay,
   diff,
+  validateTrace,
+  computeTraceChecksum,
+  withTraceChecksum,
+  verifyTraceChecksum,
+  migrateTraceVersion,
   serialize,
   deserialize,
   stringifySerialized,

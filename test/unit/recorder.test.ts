@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   SpanType,
+  TRACE_FORMAT_VERSION,
   ghost,
   registerInterceptor,
   type Interceptor,
@@ -76,7 +77,7 @@ describe('recording engine', () => {
 
     expect(trace).toMatchObject({
       name: 'my-flow',
-      version: '1.0.0',
+      version: TRACE_FORMAT_VERSION,
       startTime: 0,
       metadata: {
         name: 'my-flow',

@@ -1,7 +1,7 @@
 import type { RedactionOptions } from '../redaction/index.js';
 
 /** Trace file format version emitted by this release. */
-export const TRACE_FORMAT_VERSION = '1.0.0' as const;
+export const TRACE_FORMAT_VERSION = '3.0.0' as const;
 
 /** Supported side-effect span categories recorded by GhostTrace. */
 export enum SpanType {
@@ -83,6 +83,8 @@ export interface Trace<TSpan extends Span = Span> {
   readonly spans: readonly TSpan[];
   /** User and runtime metadata associated with the trace. */
   readonly metadata: TraceMetadata;
+  /** Optional SHA-256 integrity checksum over canonical trace JSON. */
+  readonly checksum?: string;
 }
 
 /** Options controlling where a recorded trace is saved. */

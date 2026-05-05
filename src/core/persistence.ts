@@ -1,9 +1,10 @@
 import { promises as fsPromises } from 'node:fs';
 import { dirname, extname, join } from 'node:path';
 import { ExportError } from './errors.js';
-import { serialize, type SerializedJsonValue } from './serializer.js';
 import type { RecordedTrace, Span, Trace, TraceSaveTarget } from './types.js';
 import { redactTrace, redactValue } from '../redaction/index.js';
+import { canonicalJsonStringify, toSerializableTrace } from '../validation/canonical.js';
+import { withTraceChecksum } from '../validation/checksum.js';
 
 const TRACE_FILE_SUFFIX = '.ghosttrace.json';
 const SAFE_FILENAME_SEGMENT = /[^a-z0-9._-]+/gu;
@@ -72,70 +73,8 @@ function resolveSavePath(trace: Trace, target: TraceSaveTarget | undefined): str
   return join(target.directory ?? process.cwd(), defaultTraceFileName(trace));
 }
 
-function toSerializableTrace<TSpan extends Span>(trace: Trace<TSpan>): Trace<TSpan> {
-  return {
-    id: trace.id,
-    name: trace.name,
-    version: trace.version,
-    startTime: trace.startTime,
-    endTime: trace.endTime,
-    duration: trace.duration,
-    spans: trace.spans,
-    metadata: trace.metadata
-  };
-}
-
-function isPlainObject(value: object): boolean {
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-function stableJsonValue(value: unknown): SerializedJsonValue {
-  if (value === null) {
-    return null;
-  }
-
-  switch (typeof value) {
-    case 'boolean':
-    case 'string':
-      return value;
-    case 'number':
-      return Number.isFinite(value) ? value : serialize(value);
-    case 'undefined':
-    case 'bigint':
-    case 'function':
-    case 'symbol':
-      return serialize(value);
-    case 'object':
-      break;
-  }
-
-  if (Array.isArray(value)) {
-    return Array.from({ length: value.length }, (_item, index) => {
-      if (Object.prototype.hasOwnProperty.call(value, index)) {
-        return stableJsonValue(value[index]);
-      }
-
-      return serialize(undefined);
-    });
-  }
-
-  if (!isPlainObject(value)) {
-    return serialize(value);
-  }
-
-  const record = value as Readonly<Record<string, unknown>>;
-  const stableRecord: Record<string, SerializedJsonValue> = {};
-
-  for (const key of Object.keys(record).sort()) {
-    stableRecord[key] = stableJsonValue(record[key]);
-  }
-
-  return stableRecord;
-}
-
 function stringifyTrace(trace: Trace): string {
-  return JSON.stringify(stableJsonValue(toSerializableTrace(trace)));
+  return canonicalJsonStringify(toSerializableTrace(trace));
 }
 
 /** Sanitizes a trace name into a cross-platform-safe filename segment. */
@@ -160,7 +99,7 @@ export function defaultTraceFileName(trace: Trace): string {
 
 /** Saves a trace as deterministic compact JSON and returns the path written. */
 export async function saveTrace(trace: Trace, target?: TraceSaveTarget): Promise<string> {
-  const redactedTrace = redactTrace(trace);
+  const redactedTrace = withTraceChecksum(redactTrace(trace));
   const filePath = resolveSavePath(redactedTrace, target);
 
   try {

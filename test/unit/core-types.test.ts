@@ -1,6 +1,7 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   SpanType,
+  TRACE_FORMAT_VERSION,
   createTracer,
   ghost,
   type ReplayResult,
@@ -56,7 +57,7 @@ const traceMetadata = {
 const baseTrace = {
   id: 'trace_0001',
   name: 'core-types',
-  version: '1.0.0',
+  version: TRACE_FORMAT_VERSION,
   startTime: 0,
   endTime: 3,
   duration: 3,
@@ -88,7 +89,7 @@ describe('core data model types', () => {
     expect(baseTrace).toMatchObject({
       id: 'trace_0001',
       name: 'core-types',
-      version: '1.0.0',
+      version: TRACE_FORMAT_VERSION,
       startTime: 0,
       endTime: 3,
       duration: 3,
@@ -225,7 +226,7 @@ describe('core data model types', () => {
     const customTrace: Trace<CustomReplaySpan> = {
       id: 'trace_0002',
       name: 'custom replay trace',
-      version: '1.0.0',
+      version: TRACE_FORMAT_VERSION,
       startTime: 0,
       endTime: 5,
       duration: 5,
