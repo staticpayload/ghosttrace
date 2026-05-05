@@ -1,13 +1,20 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
+  ExportError,
   SpanType,
   TRACE_FORMAT_VERSION,
+  exportHtml,
   exportJson,
   exportMarkdown,
   exportMermaid,
+  exportTrace,
   type Span,
   type Trace
 } from '../../src/index.js';
+import { diff } from '../../src/contract/diff.js';
 
 interface TestSpanOptions {
   readonly id: string;
@@ -99,6 +106,15 @@ const sampleTrace = trace([
   timerSpan
 ]);
 
+function embeddedViewerData(html: string): unknown {
+  const match = html.match(/<script id="ghosttrace-data" type="application\/json">(?<json>[\s\S]*?)<\/script>/u);
+  if (match?.groups?.json === undefined) {
+    throw new Error('Embedded viewer JSON script not found');
+  }
+
+  return JSON.parse(match.groups.json);
+}
+
 describe('export formatters', () => {
   it('exports pretty and compact JSON that round-trip to the same trace data', () => {
     const pretty = exportJson(sampleTrace, { mode: 'pretty' });
@@ -144,5 +160,163 @@ describe('export formatters', () => {
     expect(flowchart).toContain('span_0001 --> span_0002');
     expect(flowchart).toContain('GET /api/&lt;orders&gt;?q=&quot;A&amp;B&quot;');
     expect(flowchart).not.toContain('GET /api/<orders>?q="A&B"');
+  });
+
+  it('exports self-contained HTML with embedded parseable data and viewer structure', () => {
+    const html = exportHtml(sampleTrace);
+    const data = embeddedViewerData(html) as { readonly trace: Trace };
+
+    expect(html.startsWith('<!doctype html>')).toBe(true);
+    expect(html).toContain('<style>');
+    expect(html).toContain('<script>');
+    expect(html).not.toMatch(/<script\b[^>]*\bsrc=/iu);
+    expect(html).not.toMatch(/<link\b[^>]*\bhref=/iu);
+    expect(html).not.toContain('https://');
+    expect(data.trace.name).toBe(sampleTrace.name);
+    expect(data.trace.spans).toHaveLength(3);
+
+    expect(html).toContain('id="timeline"');
+    expect(html).toContain('id="trace-tree"');
+    expect(html).toContain('id="span-detail"');
+    expect(html).toContain('id="type-filter"');
+    expect(html).toContain('id="span-search"');
+    expect(html).toContain('class="json-key"');
+    expect(html).toContain('data-span-type="http"');
+    expect(html).not.toContain('checkout <flow> "A&B"</title>');
+  });
+
+  it('exports large HTML traces and renders color-coded diff changes', () => {
+    const largeSpans = Array.from({ length: 1005 }, (_item, index) => span({
+      id: `span_large_${String(index).padStart(4, '0')}`,
+      parentId: null,
+      type: index % 2 === 0 ? SpanType.Function : SpanType.Http,
+      name: `operation ${String(index)}`,
+      startTime: index,
+      duration: 1,
+      output: { index }
+    }));
+    const largeTrace = {
+      ...trace(largeSpans),
+      id: 'trace_large_export',
+      name: 'large export',
+      endTime: 1006,
+      duration: 1006
+    };
+
+    const largeHtml = exportHtml(largeTrace);
+    const largeData = embeddedViewerData(largeHtml) as { readonly trace: Trace };
+
+    expect(largeData.trace.spans).toHaveLength(1005);
+    expect(largeHtml.length).toBeLessThan(50 * 1024 * 1024);
+
+    const currentTrace = trace([
+      {
+        ...rootSpan,
+        children: [
+          {
+            ...httpSpan,
+            output: { status: 500 },
+            metadata: { statusCode: 500 }
+          }
+        ]
+      },
+      {
+        ...httpSpan,
+        output: { status: 500 },
+        metadata: { statusCode: 500 }
+      },
+      span({
+        id: 'span_0004',
+        parentId: null,
+        type: SpanType.Db,
+        name: 'SELECT orders',
+        startTime: 9,
+        duration: 2
+      })
+    ]);
+    const diffResult = diff(sampleTrace, currentTrace);
+    const diffHtml = exportHtml(currentTrace, { diff: diffResult });
+
+    expect(diffHtml).toContain('id="diff-view"');
+    expect(diffHtml).toContain('diff-added');
+    expect(diffHtml).toContain('diff-removed');
+    expect(diffHtml).toContain('diff-changed');
+    expect(diffHtml).toContain('diff-severity-breaking');
+  });
+
+  it('runs the export pipeline filter pass by type and time range', async () => {
+    const byType = await exportTrace(sampleTrace, {
+      format: 'json',
+      filter: {
+        types: [SpanType.Http]
+      }
+    });
+    const byTypeTrace = JSON.parse(byType) as Trace;
+
+    expect(byTypeTrace.spans.map((selectedSpan) => selectedSpan.type)).toEqual([SpanType.Http]);
+
+    const flatTrace = trace([httpSpan, timerSpan]);
+    const byTimeRange = await exportTrace(flatTrace, {
+      format: 'json',
+      filter: {
+        timeRange: {
+          start: 6,
+          end: 9
+        }
+      }
+    });
+    const byTimeRangeTrace = JSON.parse(byTimeRange) as Trace;
+
+    expect(byTimeRangeTrace.spans.map((selectedSpan) => selectedSpan.id)).toEqual(['span_0003']);
+  });
+
+  it('applies transform passes after filtering and before formatting', async () => {
+    let transformSawOnlyHttpSpans = false;
+    const markdown = await exportTrace(sampleTrace, {
+      format: 'markdown',
+      filter: {
+        types: [SpanType.Http]
+      },
+      transform: (filteredTrace) => {
+        transformSawOnlyHttpSpans = filteredTrace.spans.every((selectedSpan) => selectedSpan.type === SpanType.Http);
+
+        return {
+          ...filteredTrace,
+          spans: filteredTrace.spans.map((selectedSpan) => ({
+            ...selectedSpan,
+            name: 'REDACTED HTTP SPAN'
+          }))
+        };
+      }
+    });
+
+    expect(transformSawOnlyHttpSpans).toBe(true);
+    expect(markdown).toContain('REDACTED HTTP SPAN');
+    expect(markdown).not.toContain('GET /api/<orders>');
+    expect(markdown).not.toContain('setTimeout(callback)');
+  });
+
+  it('exportTrace returns strings, writes output files, and rejects unsupported formats descriptively', async () => {
+    const returnedHtml = await exportTrace(sampleTrace, { format: 'html' });
+    expect(returnedHtml).toContain('<!doctype html>');
+
+    const directory = await mkdtemp(join(tmpdir(), 'ghosttrace-export-'));
+    const outputPath = join(directory, 'trace.html');
+
+    try {
+      const writtenPath = await exportTrace(sampleTrace, {
+        format: 'html',
+        output: outputPath
+      });
+      const writtenHtml = await readFile(outputPath, 'utf8');
+
+      expect(writtenPath).toBe(outputPath);
+      expect(writtenHtml).toBe(returnedHtml);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+
+    await expect(exportTrace(sampleTrace, { format: 'xml' as never })).rejects.toThrow(ExportError);
+    await expect(exportTrace(sampleTrace, { format: 'xml' as never })).rejects.toThrow('json, markdown, mermaid, html');
   });
 });

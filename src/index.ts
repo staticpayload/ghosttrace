@@ -44,7 +44,7 @@ import { replay as replayTrace } from './replay/index.js';
 import { generateMocks } from './mock/index.js';
 import { generateFixtures } from './fixture/index.js';
 import { generateTests } from './regression/index.js';
-import { exportJson, exportMarkdown, exportMermaid } from './export/index.js';
+import { exportHtml, exportJson, exportMarkdown, exportMermaid, exportTrace } from './export/index.js';
 import { diff as diffTraces, type DiffOptions, type DiffResult } from './contract/diff.js';
 import {
   computeTraceChecksum,
@@ -187,15 +187,26 @@ export type {
   TestGenerationFramework
 } from './regression/index.js';
 export {
+  applyExportPipeline,
+  exportHtml,
   exportJson,
   exportMarkdown,
-  exportMermaid
+  exportMermaid,
+  exportTrace,
+  filterTraceForExport
 } from './export/index.js';
 export type {
+  ExportHtmlOptions,
   ExportJsonOptions,
   ExportMermaidOptions,
+  ExportPipelineOptions,
+  ExportTimeRange,
   JsonExportMode,
-  MermaidExportMode
+  MermaidExportMode,
+  TraceExportFilter,
+  TraceExportFormat,
+  TraceExportTransform,
+  ExportTraceOptions
 } from './export/index.js';
 export type {
   AddedSpanChange,
@@ -389,9 +400,11 @@ export const ghost = {
   generateMocks,
   generateFixtures,
   generateTests,
+  exportHtml,
   exportJson,
   exportMarkdown,
   exportMermaid,
+  exportTrace,
   diff,
   validateTrace,
   computeTraceChecksum,
