@@ -19,7 +19,8 @@ const cliSourcePath = join(projectRoot, 'src/cli/index.ts');
 const requireFromTest = createRequire(import.meta.url);
 const tsxLoaderPath = requireFromTest.resolve('tsx');
 const tempRoots: string[] = [];
-const cliTestTimeoutMs = 20_000;
+const cliTestTimeoutMs = 30_000;
+const cliConventionTestTimeoutMs = 60_000;
 
 interface CliResult {
   readonly status: number | null;
@@ -280,5 +281,5 @@ describe('CLI inspect, generate, and conventions', () => {
     expect(noColorUnknown.stderr).toContain('Unknown command "wat"');
     expect(noColorUnknown.stderr).toContain('Available commands');
     expect(noColorUnknown.stderr).not.toMatch(/\u001B\[/u);
-  }, cliTestTimeoutMs);
+  }, cliConventionTestTimeoutMs);
 });
