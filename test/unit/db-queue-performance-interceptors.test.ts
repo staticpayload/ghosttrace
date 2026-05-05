@@ -1,0 +1,514 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  SpanType,
+  deserialize,
+  ghost,
+  registerInterceptor,
+  wrapDb,
+  wrapQueue,
+  type DbAdapter,
+  type QueueAdapter,
+  type SerializedJsonValue,
+  type Span
+} from '../../src/index.js';
+
+interface QueryResult {
+  readonly rows: readonly Readonly<Record<string, unknown>>[];
+  readonly rowCount: number;
+}
+
+interface FakeDbClient {
+  readonly query: (query: string, params?: readonly unknown[]) => Promise<QueryResult>;
+  readonly begin: () => Promise<string>;
+  readonly commit: (transactionId: string) => Promise<{ readonly transactionId: string }>;
+  readonly rollback: (transactionId: string) => Promise<{ readonly transactionId: string }>;
+}
+
+interface QueueMessage {
+  readonly id: string;
+  readonly payload: unknown;
+}
+
+interface FakeQueueClient {
+  readonly send: (queueName: string, payload: unknown) => Promise<{ readonly id: string }>;
+  readonly receive: (queueName: string) => Promise<QueueMessage>;
+  readonly ack: (queueName: string, messageId: string) => Promise<{ readonly acknowledged: true }>;
+  readonly nack: (queueName: string, messageId: string, reason?: string) => Promise<{ readonly requeued: false }>;
+}
+
+const unregisterCallbacks: Array<() => void> = [];
+
+function spansOfType(spans: readonly Span[], type: SpanType): readonly Span[] {
+  return spans.filter((span) => span.type === type);
+}
+
+function spanAt(spans: readonly Span[], index: number): Span {
+  const span = spans[index];
+  if (span === undefined) {
+    throw new Error(`expected span at index ${index}`);
+  }
+
+  return span;
+}
+
+function deserializeAs<TValue>(value: unknown): TValue {
+  return deserialize(value as SerializedJsonValue) as TValue;
+}
+
+function queryText(args: readonly unknown[]): string {
+  const [query] = args;
+  if (typeof query !== 'string') {
+    throw new TypeError('expected query string');
+  }
+
+  return query;
+}
+
+function queueName(args: readonly unknown[]): string {
+  const [name] = args;
+  if (typeof name !== 'string') {
+    throw new TypeError('expected queue name');
+  }
+
+  return name;
+}
+
+function messageIdFromArgs(args: readonly unknown[]): string | undefined {
+  const [, messageId] = args;
+  return typeof messageId === 'string' ? messageId : undefined;
+}
+
+function messageIdFromResult(_args: readonly unknown[], result: unknown): string | undefined {
+  return typeof result === 'object' && result !== null && 'id' in result && typeof result.id === 'string'
+    ? result.id
+    : undefined;
+}
+
+function payloadFromReceive(_args: readonly unknown[], result: unknown): unknown {
+  return typeof result === 'object' && result !== null && 'payload' in result ? result.payload : undefined;
+}
+
+function createDbClient(): FakeDbClient {
+  return {
+    async query(query: string, params: readonly unknown[] = []): Promise<QueryResult> {
+      if (query.includes('FAIL')) {
+        throw new Error('db failed');
+      }
+
+      const operation = query.trim().split(/\s+/u)[0]?.toUpperCase();
+      if (operation === 'SELECT') {
+        return {
+          rows: [{ id: params[0], name: 'Ada' }],
+          rowCount: 1
+        };
+      }
+
+      return {
+        rows: [],
+        rowCount: 2
+      };
+    },
+    async begin(): Promise<string> {
+      return 'tx-1';
+    },
+    async commit(transactionId: string): Promise<{ readonly transactionId: string }> {
+      return { transactionId };
+    },
+    async rollback(transactionId: string): Promise<{ readonly transactionId: string }> {
+      return { transactionId };
+    }
+  };
+}
+
+function createDbAdapter(): DbAdapter<FakeDbClient> {
+  return {
+    name: 'fake-db',
+    operations: [
+      {
+        method: 'query',
+        query: queryText,
+        params: (args) => args[1],
+        result: (result) => (typeof result === 'object' && result !== null && 'rows' in result ? result.rows : undefined),
+        rowCount: (result) =>
+          typeof result === 'object' && result !== null && 'rowCount' in result && typeof result.rowCount === 'number'
+            ? result.rowCount
+            : undefined
+      }
+    ],
+    transactions: [
+      {
+        method: 'begin',
+        operation: 'begin',
+        transactionId: (_args, result) => (typeof result === 'string' ? result : undefined)
+      },
+      {
+        method: 'commit',
+        operation: 'commit',
+        transactionId: (args) => (typeof args[0] === 'string' ? args[0] : undefined)
+      },
+      {
+        method: 'rollback',
+        operation: 'rollback',
+        transactionId: (args) => (typeof args[0] === 'string' ? args[0] : undefined)
+      }
+    ]
+  };
+}
+
+function createQueueClient(): FakeQueueClient {
+  return {
+    async send(_queueName: string, _payload: unknown): Promise<{ readonly id: string }> {
+      return { id: 'msg-1' };
+    },
+    async receive(_queueName: string): Promise<QueueMessage> {
+      return {
+        id: 'msg-2',
+        payload: { task: 'index', priority: 3 }
+      };
+    },
+    async ack(_queueName: string, _messageId: string): Promise<{ readonly acknowledged: true }> {
+      return { acknowledged: true };
+    },
+    async nack(_queueName: string, _messageId: string, reason?: string): Promise<{ readonly requeued: false }> {
+      if (reason === 'explode') {
+        throw new Error('nack failed');
+      }
+
+      return { requeued: false };
+    }
+  };
+}
+
+function createQueueAdapter(): QueueAdapter<FakeQueueClient> {
+  return {
+    name: 'memory-queue',
+    operations: [
+      {
+        method: 'send',
+        operation: 'send',
+        queueName,
+        payload: (args) => args[1],
+        messageId: messageIdFromResult
+      },
+      {
+        method: 'receive',
+        operation: 'receive',
+        queueName,
+        payload: payloadFromReceive,
+        messageId: messageIdFromResult
+      },
+      {
+        method: 'ack',
+        operation: 'ack',
+        queueName,
+        messageId: messageIdFromArgs
+      },
+      {
+        method: 'nack',
+        operation: 'nack',
+        queueName,
+        messageId: messageIdFromArgs,
+        payload: (args) => args[2]
+      }
+    ]
+  };
+}
+
+describe('DB, queue, and performance interceptors', () => {
+  afterEach(() => {
+    performance.clearMarks();
+    performance.clearMeasures();
+
+    while (unregisterCallbacks.length > 0) {
+      unregisterCallbacks.pop()?.();
+    }
+    vi.restoreAllMocks();
+  });
+
+  it('records DB SELECT/INSERT/UPDATE/DELETE results, row counts, errors, and transaction boundaries', async () => {
+    const db = wrapDb(createDbClient(), createDbAdapter());
+
+    const trace = await ghost.record(
+      'db-operations',
+      async () => {
+        await db.query('SELECT * FROM users WHERE id = ?', [1]);
+        await db.query('INSERT INTO users(name) VALUES (?)', ['Grace']);
+        await db.query('UPDATE users SET name = ? WHERE id = ?', ['Katherine', 1]);
+        await db.query('DELETE FROM users WHERE id = ?', [1]);
+        try {
+          await db.query('SELECT FAIL', []);
+        } catch {
+          // The DB interceptor should record the operation error while user code handles it.
+        }
+
+        const transactionId = await db.begin();
+        await db.commit(transactionId);
+        const rollbackId = await db.begin();
+        await db.rollback(rollbackId);
+      },
+      { interceptors: ['db'] }
+    );
+
+    const dbSpans = spansOfType(trace.spans, SpanType.Db);
+    expect(dbSpans.map((span) => span.metadata.operation)).toEqual([
+      'SELECT',
+      'INSERT',
+      'UPDATE',
+      'DELETE',
+      'SELECT',
+      'begin',
+      'commit',
+      'begin',
+      'rollback'
+    ]);
+    expect(dbSpans.map((span) => span.name)).toEqual([
+      'db.query',
+      'db.query',
+      'db.query',
+      'db.query',
+      'db.query',
+      'db.begin',
+      'db.commit',
+      'db.begin',
+      'db.rollback'
+    ]);
+
+    expect(deserializeAs(spanAt(dbSpans, 0).input)).toEqual({
+      adapter: 'fake-db',
+      operation: 'SELECT',
+      query: 'SELECT * FROM users WHERE id = ?',
+      params: [1]
+    });
+    expect(deserializeAs(spanAt(dbSpans, 0).output)).toEqual({
+      result: [{ id: 1, name: 'Ada' }],
+      rowCount: 1
+    });
+    expect(deserializeAs(spanAt(dbSpans, 1).output)).toEqual({
+      result: [],
+      rowCount: 2
+    });
+    expect(spanAt(dbSpans, 4).error).toMatchObject({
+      name: 'Error',
+      message: 'db failed'
+    });
+    expect(deserializeAs(spanAt(dbSpans, 5).output)).toEqual({
+      transactionId: 'tx-1',
+      result: 'tx-1'
+    });
+    expect(deserializeAs(spanAt(dbSpans, 6).input)).toEqual({
+      adapter: 'fake-db',
+      operation: 'commit',
+      transactionId: 'tx-1'
+    });
+  });
+
+  it('records queue send/receive/ack/nack operations with message details and errors', async () => {
+    const queue = wrapQueue(createQueueClient(), createQueueAdapter());
+
+    const trace = await ghost.record(
+      'queue-operations',
+      async () => {
+        await queue.send('jobs', { task: 'render', priority: 1 });
+        const message = await queue.receive('jobs');
+        await queue.ack('jobs', message.id);
+        await queue.nack('jobs', 'msg-3', 'retry-later');
+        try {
+          await queue.nack('jobs', 'msg-4', 'explode');
+        } catch {
+          // The queue interceptor should record the operation error while user code handles it.
+        }
+      },
+      { interceptors: ['queue'] }
+    );
+
+    const queueSpans = spansOfType(trace.spans, SpanType.Queue);
+
+    expect(queueSpans.map((span) => span.metadata.operation)).toEqual(['send', 'receive', 'ack', 'nack', 'nack']);
+    expect(deserializeAs(spanAt(queueSpans, 0).input)).toEqual({
+      adapter: 'memory-queue',
+      operation: 'send',
+      queueName: 'jobs',
+      payload: { task: 'render', priority: 1 }
+    });
+    expect(deserializeAs(spanAt(queueSpans, 0).output)).toEqual({
+      messageId: 'msg-1',
+      result: { id: 'msg-1' }
+    });
+    expect(deserializeAs(spanAt(queueSpans, 1).output)).toEqual({
+      messageId: 'msg-2',
+      payload: { task: 'index', priority: 3 },
+      result: { id: 'msg-2', payload: { task: 'index', priority: 3 } }
+    });
+    expect(deserializeAs(spanAt(queueSpans, 2).input)).toEqual({
+      adapter: 'memory-queue',
+      operation: 'ack',
+      queueName: 'jobs',
+      messageId: 'msg-2'
+    });
+    expect(deserializeAs(spanAt(queueSpans, 3).input)).toEqual({
+      adapter: 'memory-queue',
+      operation: 'nack',
+      queueName: 'jobs',
+      messageId: 'msg-3',
+      payload: 'retry-later'
+    });
+    expect(spanAt(queueSpans, 4).error).toMatchObject({
+      name: 'Error',
+      message: 'nack failed'
+    });
+  });
+
+  it('records and replays performance.now, mark, and measure with exact values', async () => {
+    const originalNow = performance.now;
+
+    const trace = await ghost.record(
+      'performance-api',
+      () => {
+        expect(performance.now).not.toBe(originalNow);
+
+        const now = performance.now();
+        const startMark = performance.mark('ghost-start');
+        const endMark = performance.mark('ghost-end');
+        const measure = performance.measure('ghost-duration', 'ghost-start', 'ghost-end');
+
+        return {
+          now,
+          startMark: {
+            name: startMark.name,
+            entryType: startMark.entryType,
+            startTime: startMark.startTime,
+            duration: startMark.duration
+          },
+          endMarkName: endMark.name,
+          measure: {
+            name: measure.name,
+            entryType: measure.entryType,
+            startTime: measure.startTime,
+            duration: measure.duration
+          }
+        };
+      },
+      { interceptors: ['performance'] }
+    );
+
+    expect(performance.now).toBe(originalNow);
+
+    const performanceSpans = spansOfType(trace.spans, SpanType.Performance);
+    expect(performanceSpans.map((span) => span.name)).toEqual([
+      'performance.now',
+      'performance.mark',
+      'performance.mark',
+      'performance.measure'
+    ]);
+    expect(deserializeAs(spanAt(performanceSpans, 0).input)).toEqual({ operation: 'now' });
+    expect(spanAt(performanceSpans, 0).output).toBe(deserializeAs<{ readonly now: number }>(spanAt(trace.spans, 0).output).now);
+    expect(deserializeAs(spanAt(performanceSpans, 1).input)).toEqual({
+      operation: 'mark',
+      markName: 'ghost-start'
+    });
+    expect(deserializeAs(spanAt(performanceSpans, 3).input)).toEqual({
+      operation: 'measure',
+      measureName: 'ghost-duration',
+      startMark: 'ghost-start',
+      endMark: 'ghost-end'
+    });
+
+    const expectedOutput = deserializeAs(spanAt(trace.spans, 0).output);
+    const replayed = await ghost.replay(trace, () => {
+      const now = performance.now();
+      const startMark = performance.mark('ghost-start');
+      const endMark = performance.mark('ghost-end');
+      const measure = performance.measure('ghost-duration', 'ghost-start', 'ghost-end');
+
+      return {
+        now,
+        startMark: {
+          name: startMark.name,
+          entryType: startMark.entryType,
+          startTime: startMark.startTime,
+          duration: startMark.duration
+        },
+        endMarkName: endMark.name,
+        measure: {
+          name: measure.name,
+          entryType: measure.entryType,
+          startTime: measure.startTime,
+          duration: measure.duration
+        }
+      };
+    });
+
+    expect(replayed.output).toEqual(expectedOutput);
+    expect(replayed.spansMatched.map((match) => match.span.name)).toEqual([
+      'performance.now',
+      'performance.mark',
+      'performance.mark',
+      'performance.measure'
+    ]);
+    expect(performance.now).toBe(originalNow);
+  });
+
+  it('records DB, queue, performance, timer, random, and env spans together in chronological order', async () => {
+    const db = wrapDb(createDbClient(), createDbAdapter());
+    const queue = wrapQueue(createQueueClient(), createQueueAdapter());
+    const envKey = 'GHOSTTRACE_MULTI_INTERCEPTOR_ENV';
+    const originalEnvValue = process.env[envKey];
+    const originalNow = performance.now;
+
+    try {
+      const trace = await ghost.record(
+        'all-interceptors',
+        async () => {
+          const timeout = setTimeout(() => undefined, 60_000);
+          clearTimeout(timeout);
+          Math.random();
+          process.env[envKey] = 'enabled';
+          performance.now();
+          await db.query('SELECT * FROM users WHERE id = ?', [1]);
+          await queue.send('jobs', { task: 'multi' });
+        },
+        { interceptors: ['timer', 'random', 'env', 'performance', 'db', 'queue'] }
+      );
+
+      const spanTypes = new Set(trace.spans.map((span) => span.type));
+      expect(spanTypes.has(SpanType.Timer)).toBe(true);
+      expect(spanTypes.has(SpanType.Random)).toBe(true);
+      expect(spanTypes.has(SpanType.Env)).toBe(true);
+      expect(spanTypes.has(SpanType.Performance)).toBe(true);
+      expect(spanTypes.has(SpanType.Db)).toBe(true);
+      expect(spanTypes.has(SpanType.Queue)).toBe(true);
+      expect(trace.spans.map((span) => span.startTime)).toEqual(
+        [...trace.spans.map((span) => span.startTime)].sort((left, right) => left - right)
+      );
+      expect(performance.now).toBe(originalNow);
+    } finally {
+      if (originalEnvValue === undefined) {
+        delete process.env[envKey];
+      } else {
+        process.env[envKey] = originalEnvValue;
+      }
+    }
+  });
+
+  it('skips unavailable interceptors silently by default and warns when explicitly requested', async () => {
+    const install = vi.fn();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    unregisterCallbacks.push(
+      registerInterceptor({
+        name: 'unavailable-test',
+        install,
+        isAvailable: () => false
+      })
+    );
+
+    await ghost.record('skip-unavailable-default', () => 'ok');
+    expect(install).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+
+    await ghost.record('skip-unavailable-explicit', () => 'ok', {
+      interceptors: ['unavailable-test']
+    });
+    expect(install).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('unavailable-test'));
+  });
+});

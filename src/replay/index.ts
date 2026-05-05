@@ -11,6 +11,7 @@ import {
 import {
   envInterceptor,
   fsInterceptor,
+  performanceInterceptor,
   randomInterceptor,
   timerInterceptor,
   type Interceptor,
@@ -27,7 +28,8 @@ const replayInterceptors: readonly ReplayInterceptorEntry[] = [
   { type: SpanType.Timer, interceptor: timerInterceptor },
   { type: SpanType.Random, interceptor: randomInterceptor },
   { type: SpanType.Env, interceptor: envInterceptor },
-  { type: SpanType.Fs, interceptor: fsInterceptor }
+  { type: SpanType.Fs, interceptor: fsInterceptor },
+  { type: SpanType.Performance, interceptor: performanceInterceptor }
 ];
 
 function notImplemented(featureName: string): GhostTraceError {

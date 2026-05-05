@@ -29,6 +29,8 @@ import {
   type Tracer
 } from './core/types.js';
 import { wrap, wrapModule } from './interceptors/function.js';
+import { wrapDb } from './interceptors/db.js';
+import { wrapQueue } from './interceptors/queue.js';
 import { record, registerInterceptor } from './recorder/index.js';
 import { replay as replayTrace } from './replay/index.js';
 import { VERSION } from './version.js';
@@ -95,8 +97,39 @@ export {
   type TraceableFunction,
   type Tracer
 } from './core/types.js';
-export type { Interceptor, InterceptorContext, Teardown } from './interceptors/index.js';
-export { functionInterceptor, httpInterceptor, fsInterceptor, timerInterceptor, randomInterceptor, envInterceptor, wrap, wrapModule } from './interceptors/index.js';
+export type {
+  DbAdapter,
+  DbOperationDescriptor,
+  DbParamsExtractor,
+  DbQueryExtractor,
+  DbResultExtractor,
+  DbRowCountExtractor,
+  DbTransactionDescriptor,
+  DbTransactionIdExtractor,
+  Interceptor,
+  InterceptorContext,
+  QueueAdapter,
+  QueueMessageIdExtractor,
+  QueueNameExtractor,
+  QueueOperationDescriptor,
+  QueuePayloadExtractor,
+  Teardown
+} from './interceptors/index.js';
+export {
+  dbInterceptor,
+  envInterceptor,
+  fsInterceptor,
+  functionInterceptor,
+  httpInterceptor,
+  performanceInterceptor,
+  queueInterceptor,
+  randomInterceptor,
+  timerInterceptor,
+  wrap,
+  wrapDb,
+  wrapModule,
+  wrapQueue
+} from './interceptors/index.js';
 export { record, registerInterceptor } from './recorder/index.js';
 
 function cloneMetadata(metadata: TraceMetadata | undefined): TraceMetadata {
@@ -193,7 +226,9 @@ export const ghost = {
   writeSerializedJson,
   registerInterceptor,
   wrap,
+  wrapDb,
   wrapModule,
+  wrapQueue,
   GhostTraceError,
   RecordingError,
   ReplayMismatchError,

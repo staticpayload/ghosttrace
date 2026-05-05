@@ -14,10 +14,13 @@ import {
   type TraceableFunction
 } from '../core/types.js';
 import {
+  dbInterceptor,
   envInterceptor,
   fsInterceptor,
   functionInterceptor,
   httpInterceptor,
+  performanceInterceptor,
+  queueInterceptor,
   randomInterceptor,
   timerInterceptor,
   type Interceptor,
@@ -49,7 +52,10 @@ const defaultInterceptors = [
   fsInterceptor,
   timerInterceptor,
   randomInterceptor,
-  envInterceptor
+  envInterceptor,
+  dbInterceptor,
+  queueInterceptor,
+  performanceInterceptor
 ] as const;
 const interceptorRegistry = new Map<string, Interceptor>(
   defaultInterceptors.map((interceptor) => [interceptor.name, interceptor])
@@ -238,6 +244,14 @@ function selectedInterceptorNames(options: RecordOptions): readonly string[] {
   return [...new Set(names)];
 }
 
+function isExplicitlySelected(options: RecordOptions, interceptorName: string): boolean {
+  return options.interceptors?.includes(interceptorName) ?? false;
+}
+
+function warnUnavailableInterceptor(interceptorName: string): void {
+  console.warn(`GhostTrace interceptor "${interceptorName}" is unavailable and was skipped`);
+}
+
 function createInterceptorContext(addSpan: (span: Span) => void): InterceptorContext {
   return {
     addSpan
@@ -287,6 +301,9 @@ function installSelectedInterceptors(
     }
 
     if (!available) {
+      if (isExplicitlySelected(options, name)) {
+        warnUnavailableInterceptor(name);
+      }
       continue;
     }
 
