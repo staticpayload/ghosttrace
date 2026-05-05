@@ -3,7 +3,7 @@ import { dirname, extname, join } from 'node:path';
 import { ExportError } from './errors.js';
 import { serialize, type SerializedJsonValue } from './serializer.js';
 import type { RecordedTrace, Span, Trace, TraceSaveTarget } from './types.js';
-import { redactTrace } from '../redaction/index.js';
+import { redactTrace, redactValue } from '../redaction/index.js';
 
 const TRACE_FILE_SUFFIX = '.ghosttrace.json';
 const SAFE_FILENAME_SEGMENT = /[^a-z0-9._-]+/gu;
@@ -155,13 +155,13 @@ export function sanitizeTraceNameForFilename(name: string): string {
 
 /** Returns the default timestamped filename for a trace. */
 export function defaultTraceFileName(trace: Trace): string {
-  return `${sanitizeTraceNameForFilename(trace.name)}.${traceTimestamp(trace)}${TRACE_FILE_SUFFIX}`;
+  return `${sanitizeTraceNameForFilename(redactValue(trace.name))}.${traceTimestamp(trace)}${TRACE_FILE_SUFFIX}`;
 }
 
 /** Saves a trace as deterministic compact JSON and returns the path written. */
 export async function saveTrace(trace: Trace, target?: TraceSaveTarget): Promise<string> {
-  const filePath = resolveSavePath(trace, target);
   const redactedTrace = redactTrace(trace);
+  const filePath = resolveSavePath(redactedTrace, target);
 
   try {
     await fsPromises.mkdir(dirname(filePath), { recursive: true });

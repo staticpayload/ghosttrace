@@ -234,6 +234,17 @@ describe('redaction engine', () => {
     expect(redacted.authorizationHeader).toBe('[REDACTED:FIELD]');
   });
 
+  it('handles circular objects without overflowing the redaction traversal stack', () => {
+    const circular: Record<string, unknown> = {
+      password: 'long-secret-value'
+    };
+    circular.self = circular;
+
+    const redacted = asRecord(redactValue(circular, { builtinPatterns: false }));
+
+    expect(redacted.password).toBe('[REDACTED:FIELD]');
+  });
+
   it('traverses 10+ nested levels and arrays while preserving structure and normal descriptions', () => {
     const nestedKeys = Array.from({ length: 11 }, (_value, index) => `level${index}`);
     let nested: Record<string, unknown> = {
@@ -391,6 +402,42 @@ describe('redaction engine', () => {
         process.env[envKey] = originalEnvValue;
       }
       await fsPromises.unlink(tempFile).catch(() => undefined);
+    }
+  });
+
+  it('redacts env span values with sensitive-key heuristics even without built-in pattern matches', async () => {
+    const envKey = 'GHOSTTRACE_REDACTION_PASSWORD';
+    const originalEnvValue = process.env[envKey];
+    const envSecret = 'plain-env-secret-value';
+
+    process.env[envKey] = envSecret;
+
+    try {
+      const trace = await ghost.record(
+        'env-heuristic-redaction',
+        () => {
+          void process.env[envKey];
+          return 'done';
+        },
+        {
+          interceptors: ['env'],
+          redaction: {
+            builtinPatterns: false
+          }
+        }
+      );
+      const [envSpan] = spansOfType(trace.spans, SpanType.Env);
+
+      expect(envSpan).toBeDefined();
+      expect(JSON.stringify(envSpan)).not.toContain(envSecret);
+      expect(JSON.stringify(envSpan)).toContain('[REDACTED:FIELD]');
+      expect(envSpan?.metadata.key).toBe(envKey);
+    } finally {
+      if (originalEnvValue === undefined) {
+        delete process.env[envKey];
+      } else {
+        process.env[envKey] = originalEnvValue;
+      }
     }
   });
 

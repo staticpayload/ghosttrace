@@ -100,6 +100,8 @@ const CREDIT_CARD_CANDIDATE = /(?<!\d)(?:\d[ -]?){13,19}(?![\d-])/gu;
 const SENSITIVE_FIELD_NAME_PATTERN = /(?:password|secret|token|key|auth)/iu;
 const FIELD_HEURISTIC_MIN_LENGTH = 8;
 const PATH_TOKEN = '$';
+const CIRCULAR_REFERENCE_PLACEHOLDER = '[Circular]';
+const ENV_SECRET_VALUE_FIELDS = new Set(['value', 'previousValue']);
 
 const REGEX_BUILTIN_DEFINITIONS = [
   {
@@ -492,29 +494,53 @@ function redactArray(
   value: readonly unknown[],
   options: CompiledRedactionOptions,
   path: readonly PathComponent[],
-  allowExactKeyHeuristic: boolean
+  allowExactKeyHeuristic: boolean,
+  ancestors: WeakSet<object>,
+  sensitiveEnvKey: string | undefined
 ): unknown[] {
   const redacted = new Array<unknown>(value.length);
 
   for (let index = 0; index < value.length; index += 1) {
     if (Object.prototype.hasOwnProperty.call(value, index)) {
-      redacted[index] = redactRecursive(value[index], options, [...path, index], undefined, allowExactKeyHeuristic);
+      redacted[index] = redactRecursive(
+        value[index],
+        options,
+        [...path, index],
+        undefined,
+        allowExactKeyHeuristic,
+        ancestors,
+        sensitiveEnvKey
+      );
     }
   }
 
   return redacted;
 }
 
+function fieldNameForHeuristic(key: string, sensitiveEnvKey: string | undefined): string {
+  return sensitiveEnvKey !== undefined && ENV_SECRET_VALUE_FIELDS.has(key) ? sensitiveEnvKey : key;
+}
+
 function redactPlainObject(
   value: Readonly<Record<string, unknown>>,
   options: CompiledRedactionOptions,
   path: readonly PathComponent[],
-  allowExactKeyHeuristic: boolean
+  allowExactKeyHeuristic: boolean,
+  ancestors: WeakSet<object>,
+  sensitiveEnvKey: string | undefined
 ): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
 
   for (const key of Object.keys(value)) {
-    redacted[key] = redactRecursive(value[key], options, [...path, key], key, allowExactKeyHeuristic);
+    redacted[key] = redactRecursive(
+      value[key],
+      options,
+      [...path, key],
+      fieldNameForHeuristic(key, sensitiveEnvKey),
+      allowExactKeyHeuristic,
+      ancestors,
+      sensitiveEnvKey
+    );
   }
 
   return redacted;
@@ -523,15 +549,25 @@ function redactPlainObject(
 function redactMap(
   value: ReadonlyMap<unknown, unknown>,
   options: CompiledRedactionOptions,
-  allowExactKeyHeuristic: boolean
+  allowExactKeyHeuristic: boolean,
+  ancestors: WeakSet<object>,
+  sensitiveEnvKey: string | undefined
 ): Map<unknown, unknown> {
   const redacted = new Map<unknown, unknown>();
   let index = 0;
 
   for (const [key, entryValue] of value.entries()) {
     redacted.set(
-      redactRecursive(key, options, [index, 'key'], undefined, allowExactKeyHeuristic),
-      redactRecursive(entryValue, options, [index, 'value'], undefined, allowExactKeyHeuristic)
+      redactRecursive(key, options, [index, 'key'], undefined, allowExactKeyHeuristic, ancestors, sensitiveEnvKey),
+      redactRecursive(
+        entryValue,
+        options,
+        [index, 'value'],
+        undefined,
+        allowExactKeyHeuristic,
+        ancestors,
+        sensitiveEnvKey
+      )
     );
     index += 1;
   }
@@ -542,13 +578,17 @@ function redactMap(
 function redactSet(
   value: ReadonlySet<unknown>,
   options: CompiledRedactionOptions,
-  allowExactKeyHeuristic: boolean
+  allowExactKeyHeuristic: boolean,
+  ancestors: WeakSet<object>,
+  sensitiveEnvKey: string | undefined
 ): Set<unknown> {
   const redacted = new Set<unknown>();
   let index = 0;
 
   for (const item of value.values()) {
-    redacted.add(redactRecursive(item, options, [index], undefined, allowExactKeyHeuristic));
+    redacted.add(
+      redactRecursive(item, options, [index], undefined, allowExactKeyHeuristic, ancestors, sensitiveEnvKey)
+    );
     index += 1;
   }
 
@@ -560,7 +600,9 @@ function redactRecursive(
   options: CompiledRedactionOptions,
   path: readonly PathComponent[],
   fieldName: string | undefined,
-  allowExactKeyHeuristic: boolean
+  allowExactKeyHeuristic: boolean,
+  ancestors: WeakSet<object>,
+  sensitiveEnvKey: string | undefined
 ): unknown {
   if (!options.enabled) {
     return value;
@@ -584,46 +626,78 @@ function redactRecursive(
     return value;
   }
 
-  if (Array.isArray(value)) {
-    return redactArray(value, options, path, allowExactKeyHeuristic);
-  }
-
-  if (value instanceof Map) {
-    return redactMap(value, options, allowExactKeyHeuristic);
-  }
-
-  if (value instanceof Set) {
-    return redactSet(value, options, allowExactKeyHeuristic);
-  }
-
-  if (!isPlainObject(value)) {
+  if (!Array.isArray(value) && !(value instanceof Map) && !(value instanceof Set) && !isPlainObject(value)) {
     return value;
   }
 
-  return redactPlainObject(value as Readonly<Record<string, unknown>>, options, path, allowExactKeyHeuristic);
+  if (ancestors.has(value)) {
+    return CIRCULAR_REFERENCE_PLACEHOLDER;
+  }
+
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return redactArray(value, options, path, allowExactKeyHeuristic, ancestors, sensitiveEnvKey);
+    }
+
+    if (value instanceof Map) {
+      return redactMap(value, options, allowExactKeyHeuristic, ancestors, sensitiveEnvKey);
+    }
+
+    if (value instanceof Set) {
+      return redactSet(value, options, allowExactKeyHeuristic, ancestors, sensitiveEnvKey);
+    }
+
+    return redactPlainObject(
+      value as Readonly<Record<string, unknown>>,
+      options,
+      path,
+      allowExactKeyHeuristic,
+      ancestors,
+      sensitiveEnvKey
+    );
+  } finally {
+    ancestors.delete(value);
+  }
 }
 
 function redactPayloadRoot<TValue>(value: TValue, options: CompiledRedactionOptions): TValue {
-  return redactRecursive(value, options, [], undefined, true) as TValue;
+  return redactRecursive(value, options, [], undefined, true, new WeakSet<object>(), undefined) as TValue;
 }
 
 function redactSpanPayloadRoot<TValue>(
   value: TValue,
   options: CompiledRedactionOptions,
-  allowExactKeyHeuristic: boolean
+  allowExactKeyHeuristic: boolean,
+  sensitiveEnvKey: string | undefined
 ): TValue {
-  return redactRecursive(value, options, [], undefined, allowExactKeyHeuristic) as TValue;
+  return redactRecursive(
+    value,
+    options,
+    [],
+    undefined,
+    allowExactKeyHeuristic,
+    new WeakSet<object>(),
+    sensitiveEnvKey
+  ) as TValue;
+}
+
+function sensitiveEnvKey(span: Span): string | undefined {
+  const key = span.metadata.key;
+  return typeof key === 'string' && SENSITIVE_FIELD_NAME_PATTERN.test(key) ? key : undefined;
 }
 
 function redactSpanPayloads<TSpan extends Span>(span: TSpan, options: CompiledRedactionOptions): TSpan {
   const allowExactKeyHeuristic = span.type !== SpanType.Env;
+  const envKey = span.type === SpanType.Env ? sensitiveEnvKey(span) : undefined;
 
   return {
     ...span,
-    input: redactSpanPayloadRoot(span.input, options, allowExactKeyHeuristic),
-    output: redactSpanPayloadRoot(span.output, options, allowExactKeyHeuristic),
+    name: redactPayloadRoot(span.name, options),
+    input: redactSpanPayloadRoot(span.input, options, allowExactKeyHeuristic, envKey),
+    output: redactSpanPayloadRoot(span.output, options, allowExactKeyHeuristic, envKey),
     children: span.children.map((child) => redactSpanPayloads(child, options)),
-    metadata: redactSpanPayloadRoot(span.metadata, options, false) as TraceMetadata
+    metadata: redactSpanPayloadRoot(span.metadata, options, false, envKey) as TraceMetadata
   };
 }
 
@@ -638,6 +712,7 @@ export function redactTrace<TSpan extends Span>(trace: Trace<TSpan>, options: Re
 
   return {
     ...trace,
+    name: redactPayloadRoot(trace.name, compiled),
     metadata: redactPayloadRoot(trace.metadata, compiled),
     spans: trace.spans.map((span) => redactSpanPayloads(span, compiled))
   };

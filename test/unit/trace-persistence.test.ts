@@ -10,6 +10,7 @@ const ISO_TIMESTAMP_PATTERN_SOURCE = String.raw`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d
 const ISO_TIMESTAMP_PATTERN = new RegExp(`^${ISO_TIMESTAMP_PATTERN_SOURCE}$`, 'u');
 const SANITIZED_TIMESTAMP_PATTERN_SOURCE = String.raw`\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z`;
 const UNSAFE_FILENAME_CHARACTER = /[<>:"/\\|?*\u0000-\u001F]/u;
+const SECRET_TRACE_NAME_VALUE = 'sk-1234567890abcdef1234567890abcdef';
 
 async function createTempDir(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), 'ghosttrace-save-'));
@@ -91,6 +92,22 @@ describe('trace persistence', () => {
         recordedAt: expect.stringMatching(ISO_TIMESTAMP_PATTERN)
       })
     );
+  });
+
+  it('derives default filenames from the redacted trace name', async () => {
+    const directory = await createTempDir();
+    const trace = await ghost.record(`Checkout ${SECRET_TRACE_NAME_VALUE}`, () => 'ok', {
+      interceptors: []
+    });
+
+    const savedPath = await trace.save({ directory });
+    const parsed = await readJsonFile(savedPath);
+
+    expect(basename(savedPath)).toMatch(
+      new RegExp(`^checkout-redacted-api_key\\.${SANITIZED_TIMESTAMP_PATTERN_SOURCE}\\.ghosttrace\\.json$`, 'u')
+    );
+    expect(basename(savedPath)).not.toContain(SECRET_TRACE_NAME_VALUE.toLowerCase());
+    expect(JSON.stringify(parsed)).not.toContain(SECRET_TRACE_NAME_VALUE);
   });
 
   it('uses wall-clock ISO timestamps for default filenames without same-name collisions', async () => {
