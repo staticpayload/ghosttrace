@@ -254,6 +254,9 @@ function outputValue(span: Span): unknown {
     if ('value' in span.output) {
       return outputRecordValue(span.output, 'value');
     }
+    if ((span.name === 'new Date' || span.metadata.operation === 'new Date') && typeof span.output.iso === 'string') {
+      return outputRecordValue(span.output, 'iso');
+    }
   }
 
   if (span.type === SpanType.Fs) {

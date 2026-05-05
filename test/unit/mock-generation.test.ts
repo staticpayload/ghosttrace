@@ -236,4 +236,25 @@ describe('generateMocks', () => {
     expect(dateNow()).toBe(1_702_000_000_000);
     await expect(writeFile()).resolves.toBeUndefined();
   });
+
+  it('normalizes new Date timer span output to the recorded ISO value', async () => {
+    const source = generateMocks(trace([
+      span({
+        id: 'span_1',
+        type: SpanType.Timer,
+        name: 'new Date',
+        output: {
+          timestamp: 1_702_000_000_000,
+          iso: '2023-12-08T01:46:40.000Z'
+        },
+        metadata: { operation: 'new Date' }
+      })
+    ]), { format: 'function' });
+
+    expectValidTypeScript(source);
+    const moduleExports = await importGenerated(source);
+    const newDate = mockExport(moduleExports, 'new_Date');
+
+    expect(newDate()).toBe('2023-12-08T01:46:40.000Z');
+  });
 });
