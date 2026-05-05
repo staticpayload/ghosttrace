@@ -10,6 +10,7 @@ const DB_SENTINEL = '__GHOSTTRACE_DB_INTERCEPTOR_SENTINEL__';
 
 type ClientMethodKey<TClient extends object> = Extract<keyof TClient, string>;
 type ClientMethod = (...args: unknown[]) => unknown;
+type DbOutputType = 'return' | 'resolve' | 'throw' | 'reject';
 
 /** Extracts query metadata from DB method arguments. */
 export type DbQueryExtractor = (args: readonly unknown[]) => unknown;
@@ -318,6 +319,16 @@ function completeInvocation(
   active.session.addSpan(completeDbSpan(active.context, span, output, error));
 }
 
+function withOutputType(
+  type: DbOutputType,
+  output: Readonly<Record<string, unknown>> = {}
+): Readonly<Record<string, unknown>> {
+  return {
+    type,
+    ...output
+  };
+}
+
 function deserializeSpanValue(value: unknown): unknown {
   return deserialize(value as SerializedJsonValue);
 }
@@ -336,36 +347,36 @@ function errorFromSpan(span: Span): Error | null {
   return error;
 }
 
-function isAsyncClientMethod(method: ClientMethod): boolean {
-  return method.constructor.name === 'AsyncFunction';
+function isDbOutputType(value: unknown): value is DbOutputType {
+  return value === 'return' || value === 'resolve' || value === 'throw' || value === 'reject';
 }
 
-function replayMethodValue(targetMethod: ClientMethod, value: unknown): unknown {
-  return isAsyncClientMethod(targetMethod) ? Promise.resolve(value) : value;
+function outputTypeFromDeserializedOutput(output: unknown): DbOutputType | undefined {
+  if (!isRecord(output) || !isDbOutputType(output.type)) {
+    return undefined;
+  }
+
+  return output.type;
 }
 
-function replayMethodError(targetMethod: ClientMethod, error: Error): unknown {
-  if (isAsyncClientMethod(targetMethod)) {
+function replayMethodValue(outputType: DbOutputType | undefined, value: unknown): unknown {
+  return outputType === 'resolve' ? Promise.resolve(value) : value;
+}
+
+function replayMethodError(outputType: DbOutputType | undefined, error: Error): unknown {
+  if (outputType === 'reject') {
     return Promise.reject(error);
   }
 
   throw error;
 }
 
-function dbReturnValueFromOutput(output: unknown): unknown {
-  const value = deserializeSpanValue(output);
-  if (!isRecord(value) || !('result' in value)) {
-    return value;
+function dbReturnValueFromDeserializedOutput(output: unknown): unknown {
+  if (!isRecord(output) || !('result' in output)) {
+    return output;
   }
 
-  if (Array.isArray(value.result) && typeof value.rowCount === 'number') {
-    return {
-      rows: value.result,
-      rowCount: value.rowCount
-    };
-  }
-
-  return value.result;
+  return output.result;
 }
 
 function invokeReplayedDbMethod(
@@ -381,11 +392,13 @@ function invokeReplayedDbMethod(
   }
 
   const error = errorFromSpan(span);
+  const output = deserializeSpanValue(span.output);
+  const outputType = outputTypeFromDeserializedOutput(output);
   if (error !== null) {
-    return replayMethodError(targetMethod, error);
+    return replayMethodError(outputType, error);
   }
 
-  return replayMethodValue(targetMethod, dbReturnValueFromOutput(span.output));
+  return replayMethodValue(outputType, dbReturnValueFromDeserializedOutput(output));
 }
 
 function invokeRecordedDbMethod(
@@ -394,7 +407,7 @@ function invokeRecordedDbMethod(
   thisArg: unknown,
   args: readonly unknown[],
   metadata: DbInvocationMetadata,
-  outputForResult: (result: unknown) => unknown
+  outputForResult: (result: unknown) => Readonly<Record<string, unknown>>
 ): unknown {
   const span = createPendingDbSpan(active.context, metadata.name, active.context.clock.now(), metadata.input, metadata.metadata);
 
@@ -404,20 +417,20 @@ function invokeRecordedDbMethod(
     if (isPromiseLike(result)) {
       return Promise.resolve(result).then(
         (resolved) => {
-          completeInvocation(active, span, outputForResult(resolved), null);
+          completeInvocation(active, span, withOutputType('resolve', outputForResult(resolved)), null);
           return resolved;
         },
         (error: unknown) => {
-          completeInvocation(active, span, undefined, error);
+          completeInvocation(active, span, withOutputType('reject'), error);
           throw error;
         }
       );
     }
 
-    completeInvocation(active, span, outputForResult(result), null);
+    completeInvocation(active, span, withOutputType('return', outputForResult(result)), null);
     return result;
   } catch (error) {
-    completeInvocation(active, span, undefined, error);
+    completeInvocation(active, span, withOutputType('throw'), error);
     throw error;
   }
 }

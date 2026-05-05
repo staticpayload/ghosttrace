@@ -1356,10 +1356,14 @@ function nodeRequestName(protocol: RequestProtocol): string {
   return `${protocol === 'http:' ? 'http' : 'https'}.request`;
 }
 
-function nodeReplayInputDetails(protocol: RequestProtocol, args: readonly unknown[]): Record<string, unknown> {
+function nodeReplayInputDetails(
+  protocol: RequestProtocol,
+  args: readonly unknown[],
+  requestBody: BodyAccumulator
+): Record<string, unknown> {
   return {
     ...nodeRequestDetails(protocol, args),
-    body: undefined
+    body: finalizeBodyAccumulator(requestBody)
   };
 }
 
@@ -1391,15 +1395,114 @@ function replayIncomingMessage(output: Readonly<Record<string, unknown>>): Incom
   return response;
 }
 
-function createReplayClientRequest(span: Span, args: readonly unknown[]): ClientRequest {
+function emitReplayedNodeResponse(request: ClientRequest, span: Span, args: readonly unknown[]): void {
+  const responseCallback = responseCallbackFromArgs(args);
+  const error = errorFromSpan(span);
+
+  if (error !== null) {
+    request.emit('error', error);
+    return;
+  }
+
+  const output = outputRecordFromSpan(span);
+  const response = replayIncomingMessage(output);
+  const body = bufferFromRecordedBody(output.body);
+
+  responseCallback?.(response);
+  request.emit('response', response);
+  (response as unknown as PassThrough).end(body);
+}
+
+function requestArgsWithoutResponseCallback(args: readonly unknown[]): readonly unknown[] {
+  return args.filter((arg) => typeof arg !== 'function');
+}
+
+function replayRequestBodyBuffer(accumulator: BodyAccumulator): Buffer | undefined {
+  if (!accumulator.hasBody) {
+    return undefined;
+  }
+
+  return Buffer.concat(accumulator.chunks, accumulator.capturedBytes);
+}
+
+function passThroughUnmatchedNodeRequest(
+  original: NodeRequestFunction,
+  target: object,
+  args: readonly unknown[],
+  requestBody: BodyAccumulator,
+  replayRequest: ClientRequest
+): void {
+  const responseCallback = responseCallbackFromArgs(args);
+  const liveRequest = callNodeRequest(original, target, requestArgsWithoutResponseCallback(args));
+  const body = replayRequestBodyBuffer(requestBody);
+
+  liveRequest.once('response', (response) => {
+    responseCallback?.(response);
+    replayRequest.emit('response', response);
+  });
+  liveRequest.once('error', (error) => {
+    replayRequest.emit('error', error);
+  });
+  liveRequest.once('timeout', () => {
+    replayRequest.emit('timeout');
+  });
+  liveRequest.once('abort', () => {
+    replayRequest.emit('abort');
+  });
+
+  if (body !== undefined) {
+    liveRequest.write(body);
+  }
+  liveRequest.end();
+}
+
+function endCallbackFromArgs(args: readonly unknown[]): (() => void) | undefined {
+  const callback = [...args].reverse().find((arg): arg is () => void => typeof arg === 'function');
+  return callback;
+}
+
+function createReplayClientRequest(
+  active: ActiveHttpContext,
+  protocol: RequestProtocol,
+  original: NodeRequestFunction,
+  target: object,
+  args: readonly unknown[]
+): ClientRequest {
   const request = new PassThrough() as unknown as ClientRequest;
   const mutableRequest = request as unknown as MutableReplayClientRequestMethods;
-  const responseCallback = responseCallbackFromArgs(args);
+  const requestBody = createBodyAccumulator();
+  let ended = false;
 
-  mutableRequest.write = function ghosttraceReplayRequestWrite(): boolean {
+  mutableRequest.write = function ghosttraceReplayRequestWrite(...writeArgs: unknown[]): boolean {
+    if (ended) {
+      return false;
+    }
+
+    captureNodeRequestChunk(requestBody, writeArgs);
     return true;
   };
-  mutableRequest.end = function ghosttraceReplayRequestEnd(this: ClientRequest): ClientRequest {
+  mutableRequest.end = function ghosttraceReplayRequestEnd(this: ClientRequest, ...endArgs: unknown[]): ClientRequest {
+    if (ended) {
+      return this;
+    }
+
+    ended = true;
+    captureNodeRequestChunk(requestBody, endArgs);
+
+    const span = active.replayStore?.consumeSpan(SpanType.Http, nodeRequestName(protocol), nodeReplayInputDetails(protocol, args, requestBody))?.span;
+    if (span === undefined) {
+      passThroughUnmatchedNodeRequest(original, target, args, requestBody, request);
+    } else {
+      scheduleReplayTask(() => {
+        emitReplayedNodeResponse(request, span, args);
+      });
+    }
+
+    const endCallback = endCallbackFromArgs(endArgs);
+    if (endCallback !== undefined) {
+      scheduleReplayTask(endCallback);
+    }
+
     return this;
   };
   mutableRequest.setTimeout = function ghosttraceReplayRequestSetTimeout(
@@ -1417,22 +1520,6 @@ function createReplayClientRequest(span: Span, args: readonly unknown[]): Client
     this.destroy(new Error('HTTP replay request aborted'));
   };
 
-  scheduleReplayTask(() => {
-    const error = errorFromSpan(span);
-    if (error !== null) {
-      request.emit('error', error);
-      return;
-    }
-
-    const output = outputRecordFromSpan(span);
-    const response = replayIncomingMessage(output);
-    const body = bufferFromRecordedBody(output.body);
-
-    responseCallback?.(response);
-    request.emit('response', response);
-    (response as unknown as PassThrough).end(body);
-  });
-
   return request;
 }
 
@@ -1448,13 +1535,7 @@ function replayNodeRequest(
     throw new TypeError(`${protocol === 'http:' ? 'http' : 'https'}.request is not available`);
   }
 
-  const name = nodeRequestName(protocol);
-  const span = active.replayStore?.consumeSpan(SpanType.Http, name, nodeReplayInputDetails(protocol, args))?.span;
-  if (span === undefined) {
-    return callNodeRequest(original, target, args);
-  }
-
-  return createReplayClientRequest(span, args);
+  return createReplayClientRequest(active, protocol, original, target, args);
 }
 
 function createPatchedNodeRequest(

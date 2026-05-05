@@ -159,6 +159,33 @@ function requestText(url: string, options: RequestTextOptions = {}): Promise<str
   });
 }
 
+function requestTextWithSplitBody(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      url,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'text/plain'
+        }
+      },
+      (response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk: string) => {
+          body += chunk;
+        });
+        response.once('end', () => resolve(body));
+        response.once('error', reject);
+      }
+    );
+
+    request.once('error', reject);
+    request.write('write-body-');
+    request.end('end-body');
+  });
+}
+
 describe('HTTP interceptor', () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -727,6 +754,38 @@ describe('HTTP interceptor', () => {
 
     expect(replayed.output).toBe('node-recorded-body');
     expect(replayed.spansMatched.map((match) => match.span.name)).toEqual(['http.request']);
+  });
+
+  it('matches node http.request replay after accumulating write and end body chunks', async () => {
+    const server = http.createServer(async (request, response) => {
+      const body = await readIncomingRequest(request);
+      response.writeHead(207, {
+        'content-type': 'text/plain',
+        'x-node-body-replay': 'yes'
+      });
+      response.end(`recorded:${body}`);
+    });
+
+    const port = await listenOnEphemeralPort(server);
+    const url = `http://127.0.0.1:${port}/node-body-replay`;
+    const trace = await ghost.record('node-request-body-replay', () => requestTextWithSplitBody(url), {
+      interceptors: ['http']
+    });
+    await closeServer(server);
+
+    const recordedHttpSpan = httpSpans(trace.spans)[0];
+    expect(recordedHttpSpan).toMatchObject({
+      input: {
+        method: 'POST',
+        url,
+        body: 'write-body-end-body'
+      }
+    });
+
+    const replayed = await ghost.replay(trace, () => requestTextWithSplitBody(url));
+
+    expect(replayed.output).toBe('recorded:write-body-end-body');
+    expect(replayed.spansMatched.map((match) => match.span.id)).toEqual([recordedHttpSpan?.id]);
   });
 
   it('records node http request timeouts as errored HTTP spans', async () => {

@@ -10,6 +10,7 @@ const QUEUE_SENTINEL = '__GHOSTTRACE_QUEUE_INTERCEPTOR_SENTINEL__';
 
 type ClientMethodKey<TClient extends object> = Extract<keyof TClient, string>;
 type ClientMethod = (...args: unknown[]) => unknown;
+type QueueOutputType = 'return' | 'resolve' | 'throw' | 'reject';
 
 /** Extracts a queue name from method arguments and/or result. */
 export type QueueNameExtractor = (args: readonly unknown[], result: unknown) => string | undefined;
@@ -246,6 +247,16 @@ function completeInvocation(active: ActiveQueueContext, span: Span, output: unkn
   active.session.addSpan(completeQueueSpan(active.context, span, output, error));
 }
 
+function withOutputType(
+  type: QueueOutputType,
+  output: Readonly<Record<string, unknown>> = {}
+): Readonly<Record<string, unknown>> {
+  return {
+    type,
+    ...output
+  };
+}
+
 function deserializeSpanValue(value: unknown): unknown {
   return deserialize(value as SerializedJsonValue);
 }
@@ -264,29 +275,36 @@ function errorFromSpan(span: Span): Error | null {
   return error;
 }
 
-function isAsyncClientMethod(method: ClientMethod): boolean {
-  return method.constructor.name === 'AsyncFunction';
+function isQueueOutputType(value: unknown): value is QueueOutputType {
+  return value === 'return' || value === 'resolve' || value === 'throw' || value === 'reject';
 }
 
-function replayMethodValue(targetMethod: ClientMethod, value: unknown): unknown {
-  return isAsyncClientMethod(targetMethod) ? Promise.resolve(value) : value;
+function outputTypeFromDeserializedOutput(output: unknown): QueueOutputType | undefined {
+  if (!isRecord(output) || !isQueueOutputType(output.type)) {
+    return undefined;
+  }
+
+  return output.type;
 }
 
-function replayMethodError(targetMethod: ClientMethod, error: Error): unknown {
-  if (isAsyncClientMethod(targetMethod)) {
+function replayMethodValue(outputType: QueueOutputType | undefined, value: unknown): unknown {
+  return outputType === 'resolve' ? Promise.resolve(value) : value;
+}
+
+function replayMethodError(outputType: QueueOutputType | undefined, error: Error): unknown {
+  if (outputType === 'reject') {
     return Promise.reject(error);
   }
 
   throw error;
 }
 
-function queueReturnValueFromOutput(output: unknown): unknown {
-  const value = deserializeSpanValue(output);
-  if (!isRecord(value) || !('result' in value)) {
-    return value;
+function queueReturnValueFromDeserializedOutput(output: unknown): unknown {
+  if (!isRecord(output) || !('result' in output)) {
+    return output;
   }
 
-  return value.result;
+  return output.result;
 }
 
 function invokeReplayedQueueMethod(
@@ -302,11 +320,13 @@ function invokeReplayedQueueMethod(
   }
 
   const error = errorFromSpan(span);
+  const output = deserializeSpanValue(span.output);
+  const outputType = outputTypeFromDeserializedOutput(output);
   if (error !== null) {
-    return replayMethodError(targetMethod, error);
+    return replayMethodError(outputType, error);
   }
 
-  return replayMethodValue(targetMethod, queueReturnValueFromOutput(span.output));
+  return replayMethodValue(outputType, queueReturnValueFromDeserializedOutput(output));
 }
 
 function invokeRecordedQueueMethod(
@@ -315,7 +335,7 @@ function invokeRecordedQueueMethod(
   thisArg: unknown,
   args: readonly unknown[],
   metadata: QueueInvocationMetadata,
-  outputForResult: (result: unknown) => unknown
+  outputForResult: (result: unknown) => Readonly<Record<string, unknown>>
 ): unknown {
   const span = createPendingQueueSpan(active.context, metadata.name, active.context.clock.now(), metadata.input, metadata.metadata);
 
@@ -325,20 +345,20 @@ function invokeRecordedQueueMethod(
     if (isPromiseLike(result)) {
       return Promise.resolve(result).then(
         (resolved) => {
-          completeInvocation(active, span, outputForResult(resolved), null);
+          completeInvocation(active, span, withOutputType('resolve', outputForResult(resolved)), null);
           return resolved;
         },
         (error: unknown) => {
-          completeInvocation(active, span, undefined, error);
+          completeInvocation(active, span, withOutputType('reject'), error);
           throw error;
         }
       );
     }
 
-    completeInvocation(active, span, outputForResult(result), null);
+    completeInvocation(active, span, withOutputType('return', outputForResult(result)), null);
     return result;
   } catch (error) {
-    completeInvocation(active, span, undefined, error);
+    completeInvocation(active, span, withOutputType('throw'), error);
     throw error;
   }
 }

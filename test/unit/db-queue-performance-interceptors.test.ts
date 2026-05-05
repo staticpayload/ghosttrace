@@ -36,6 +36,14 @@ interface FakeQueueClient {
   readonly nack: (queueName: string, messageId: string, reason?: string) => Promise<{ readonly requeued: false }>;
 }
 
+interface PromiseRowsDbClient {
+  readonly query: (query: string) => Promise<readonly Readonly<Record<string, unknown>>[]>;
+}
+
+interface PromiseRejectingQueueClient {
+  readonly nack: (queueName: string, messageId: string) => Promise<{ readonly requeued: false }>;
+}
+
 const unregisterCallbacks: Array<() => void> = [];
 
 function spansOfType(spans: readonly Span[], type: SpanType): readonly Span[] {
@@ -53,6 +61,14 @@ function spanAt(spans: readonly Span[], index: number): Span {
 
 function deserializeAs<TValue>(value: unknown): TValue {
   return deserialize(value as SerializedJsonValue) as TValue;
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    (typeof value === 'object' || typeof value === 'function') &&
+    value !== null &&
+    typeof (value as { readonly then?: unknown }).then === 'function'
+  );
 }
 
 function queryText(args: readonly unknown[]): string {
@@ -120,6 +136,22 @@ function createDbClient(): FakeDbClient {
   };
 }
 
+function createPromiseRowsDbClient(): PromiseRowsDbClient {
+  return {
+    query(_query: string): Promise<readonly Readonly<Record<string, unknown>>[]> {
+      return Promise.resolve([{ id: 'raw-1', name: 'Raw Ada' }]);
+    }
+  };
+}
+
+function createPromiseRejectingQueueClient(): PromiseRejectingQueueClient {
+  return {
+    nack(_queueName: string, _messageId: string): Promise<{ readonly requeued: false }> {
+      return Promise.reject(new Error('promise nack failed'));
+    }
+  };
+}
+
 function createDbAdapter(): DbAdapter<FakeDbClient> {
   return {
     name: 'fake-db',
@@ -155,6 +187,36 @@ function createDbAdapter(): DbAdapter<FakeDbClient> {
   };
 }
 
+function createFullResultDbAdapter(): DbAdapter<FakeDbClient> {
+  return {
+    name: 'fake-db',
+    operations: [
+      {
+        method: 'query',
+        query: queryText,
+        params: (args) => args[1],
+        rowCount: (result) =>
+          typeof result === 'object' && result !== null && 'rowCount' in result && typeof result.rowCount === 'number'
+            ? result.rowCount
+            : undefined
+      }
+    ]
+  };
+}
+
+function createPromiseRowsDbAdapter(): DbAdapter<PromiseRowsDbClient> {
+  return {
+    name: 'promise-rows-db',
+    operations: [
+      {
+        method: 'query',
+        query: queryText,
+        rowCount: (result) => (Array.isArray(result) ? result.length : undefined)
+      }
+    ]
+  };
+}
+
 function createQueueClient(): FakeQueueClient {
   return {
     async send(_queueName: string, _payload: unknown): Promise<{ readonly id: string }> {
@@ -176,6 +238,20 @@ function createQueueClient(): FakeQueueClient {
 
       return { requeued: false };
     }
+  };
+}
+
+function createPromiseRejectingQueueAdapter(): QueueAdapter<PromiseRejectingQueueClient> {
+  return {
+    name: 'promise-queue',
+    operations: [
+      {
+        method: 'nack',
+        operation: 'nack',
+        queueName,
+        messageId: messageIdFromArgs
+      }
+    ]
   };
 }
 
@@ -280,10 +356,12 @@ describe('DB, queue, and performance interceptors', () => {
       params: [1]
     });
     expect(deserializeAs(spanAt(dbSpans, 0).output)).toEqual({
+      type: 'resolve',
       result: [{ id: 1, name: 'Ada' }],
       rowCount: 1
     });
     expect(deserializeAs(spanAt(dbSpans, 1).output)).toEqual({
+      type: 'resolve',
       result: [],
       rowCount: 2
     });
@@ -292,6 +370,7 @@ describe('DB, queue, and performance interceptors', () => {
       message: 'db failed'
     });
     expect(deserializeAs(spanAt(dbSpans, 5).output)).toEqual({
+      type: 'resolve',
       transactionId: 'tx-1',
       result: 'tx-1'
     });
@@ -331,10 +410,12 @@ describe('DB, queue, and performance interceptors', () => {
       payload: { task: 'render', priority: 1 }
     });
     expect(deserializeAs(spanAt(queueSpans, 0).output)).toEqual({
+      type: 'resolve',
       messageId: 'msg-1',
       result: { id: 'msg-1' }
     });
     expect(deserializeAs(spanAt(queueSpans, 1).output)).toEqual({
+      type: 'resolve',
       messageId: 'msg-2',
       payload: { task: 'index', priority: 3 },
       result: { id: 'msg-2', payload: { task: 'index', priority: 3 } }
@@ -359,7 +440,7 @@ describe('DB, queue, and performance interceptors', () => {
   });
 
   it('replays DB and queue operations from recorded spans without calling live clients', async () => {
-    const db = wrapDb(createDbClient(), createDbAdapter());
+    const db = wrapDb(createDbClient(), createFullResultDbAdapter());
     const queue = wrapQueue(createQueueClient(), createQueueAdapter());
 
     const trace = await ghost.record(
@@ -414,7 +495,7 @@ describe('DB, queue, and performance interceptors', () => {
       ack: vi.fn(async (): Promise<{ readonly acknowledged: true }> => ({ acknowledged: true })),
       nack: liveQueueNack
     };
-    const replayDb = wrapDb(liveDbClient, createDbAdapter());
+    const replayDb = wrapDb(liveDbClient, createFullResultDbAdapter());
     const replayQueue = wrapQueue(liveQueueClient, createQueueAdapter());
 
     const replayed = await ghost.replay(trace, async () => {
@@ -453,6 +534,88 @@ describe('DB, queue, and performance interceptors', () => {
     ]);
     expect(liveDbQuery).not.toHaveBeenCalled();
     expect(liveQueueReceive).not.toHaveBeenCalled();
+    expect(liveQueueNack).not.toHaveBeenCalled();
+  });
+
+  it('preserves raw DB result payloads and Promise resolution for non-async adapter methods', async () => {
+    const adapter = createPromiseRowsDbAdapter();
+    const db = wrapDb(createPromiseRowsDbClient(), adapter);
+
+    const trace = await ghost.record('db-raw-promise-result', () => db.query('SELECT raw rows'), {
+      interceptors: ['db']
+    });
+
+    const dbSpan = spanAt(spansOfType(trace.spans, SpanType.Db), 0);
+    expect(deserializeAs(dbSpan.output)).toEqual({
+      type: 'resolve',
+      result: [{ id: 'raw-1', name: 'Raw Ada' }],
+      rowCount: 1
+    });
+
+    const liveDbQuery = vi.fn((_query: string): Promise<readonly Readonly<Record<string, unknown>>[]> =>
+      Promise.reject(new Error('live rows query should not run during replay'))
+    );
+    const replayDb = wrapDb<PromiseRowsDbClient>({ query: liveDbQuery }, adapter);
+    let returnedPromise = false;
+
+    const replayed = await ghost.replay(trace, async () => {
+      const rowsPromise = replayDb.query('SELECT raw rows');
+      returnedPromise = isPromiseLike(rowsPromise);
+      return rowsPromise;
+    });
+
+    expect(returnedPromise).toBe(true);
+    expect(replayed.output).toEqual([{ id: 'raw-1', name: 'Raw Ada' }]);
+    expect(liveDbQuery).not.toHaveBeenCalled();
+  });
+
+  it('replays queue rejections as Promise rejections for non-async adapter methods', async () => {
+    const adapter = createPromiseRejectingQueueAdapter();
+    const queue = wrapQueue(createPromiseRejectingQueueClient(), adapter);
+
+    const trace = await ghost.record(
+      'queue-promise-rejection',
+      async () => {
+        try {
+          await queue.nack('jobs', 'msg-promise');
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error);
+        }
+
+        return 'missing rejection';
+      },
+      { interceptors: ['queue'] }
+    );
+
+    const queueSpan = spanAt(spansOfType(trace.spans, SpanType.Queue), 0);
+    expect(deserializeAs(queueSpan.output)).toEqual({ type: 'reject' });
+    expect(queueSpan.error).toMatchObject({
+      name: 'Error',
+      message: 'promise nack failed'
+    });
+
+    const liveQueueNack = vi.fn(
+      (_queueName: string, _messageId: string): Promise<{ readonly requeued: false }> =>
+        Promise.resolve({ requeued: false as const })
+    );
+    const replayQueue = wrapQueue<PromiseRejectingQueueClient>({ nack: liveQueueNack }, adapter);
+    let returnedPromise = false;
+
+    const replayed = await ghost.replay(trace, async () => {
+      const rejectedPromise = replayQueue.nack('jobs', 'msg-promise');
+      returnedPromise = isPromiseLike(rejectedPromise);
+
+      try {
+        await rejectedPromise;
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+
+      return 'missing rejection';
+    });
+
+    expect(returnedPromise).toBe(true);
+    expect(replayed.output).toBe('promise nack failed');
     expect(liveQueueNack).not.toHaveBeenCalled();
   });
 
