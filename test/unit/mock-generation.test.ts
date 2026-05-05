@@ -202,4 +202,38 @@ describe('generateMocks', () => {
     expect(generateMocks(sampleTrace, { format: 'function', includeErrors: false })).not.toContain('failSync');
     expect(generateMocks(sampleTrace, { format: 'function', includeErrors: true })).toContain('failSync');
   });
+
+  it('normalizes structured env timer and filesystem outputs to runtime return values', async () => {
+    const source = generateMocks(trace([
+      span({
+        id: 'span_1',
+        type: SpanType.Env,
+        name: 'process.env.get',
+        output: { value: 'recorded-env-value', exists: true }
+      }),
+      span({
+        id: 'span_2',
+        type: SpanType.Timer,
+        name: 'Date.now',
+        output: { value: 1_702_000_000_000 }
+      }),
+      span({
+        id: 'span_3',
+        type: SpanType.Fs,
+        name: 'fs.promises.writeFile',
+        output: { success: true },
+        metadata: { api: 'promises', operation: 'writeFile' }
+      })
+    ]), { format: 'function' });
+
+    expectValidTypeScript(source);
+    const moduleExports = await importGenerated(source);
+    const envGet = mockExport(moduleExports, 'process_env_get');
+    const dateNow = mockExport(moduleExports, 'Date_now');
+    const writeFile = mockExport(moduleExports, 'fs_promises_writeFile');
+
+    expect(envGet()).toBe('recorded-env-value');
+    expect(dateNow()).toBe(1_702_000_000_000);
+    await expect(writeFile()).resolves.toBeUndefined();
+  });
 });

@@ -32,6 +32,7 @@ interface GeneratedTestCase {
   readonly functionName: string;
   readonly input: unknown;
   readonly output: unknown;
+  readonly sideEffects: readonly ExpectedSideEffect[];
 }
 
 interface ExpectedSideEffect {
@@ -74,27 +75,121 @@ function readStringField(value: unknown, key: string): string | undefined {
   return typeof field === 'string' ? field : undefined;
 }
 
-function functionSpans(trace: Trace): readonly Span[] {
-  const roots = trace.spans.filter((span) => span.type === SpanType.Function && span.parentId === null);
-  if (roots.length > 0) {
-    return roots;
+function flattenedTraceSpans(trace: Trace): readonly Span[] {
+  const spans: Span[] = [];
+  const seenSpanIds = new Set<string>();
+
+  const visit = (span: Span): void => {
+    if (seenSpanIds.has(span.id)) {
+      return;
+    }
+
+    seenSpanIds.add(span.id);
+    spans.push(span);
+    for (const child of span.children) {
+      visit(child);
+    }
+  };
+
+  for (const span of trace.spans) {
+    visit(span);
   }
 
-  return trace.spans.filter((span) => span.type === SpanType.Function);
+  return spans;
+}
+
+function isRecorderRootSpan(span: Span): boolean {
+  return span.type === SpanType.Function && span.parentId === null && typeof span.metadata.traceName === 'string';
+}
+
+function recorderRootChildSpans(spans: readonly Span[], type: SpanType.Function | SpanType.Http): readonly Span[] {
+  const recorderRootIds = new Set(spans.flatMap((span) => (isRecorderRootSpan(span) ? [span.id] : [])));
+  if (recorderRootIds.size === 0) {
+    return [];
+  }
+
+  return spans.filter((span) => span.parentId !== null && recorderRootIds.has(span.parentId) && span.type === type);
+}
+
+function callableSpans(spans: readonly Span[]): readonly Span[] {
+  const rootFunctionChildren = recorderRootChildSpans(spans, SpanType.Function);
+  if (rootFunctionChildren.length > 0) {
+    return rootFunctionChildren;
+  }
+
+  const rootHttpChildren = recorderRootChildSpans(spans, SpanType.Http);
+  if (rootHttpChildren.length > 0) {
+    return rootHttpChildren;
+  }
+
+  const functionCandidates = spans.filter((span) => span.type === SpanType.Function && !isRecorderRootSpan(span));
+  if (functionCandidates.length > 0) {
+    return functionCandidates;
+  }
+
+  const childHttpCandidates = spans.filter((span) => span.type === SpanType.Http && span.parentId !== null);
+  if (childHttpCandidates.length > 0) {
+    return childHttpCandidates;
+  }
+
+  const httpCandidates = spans.filter((span) => span.type === SpanType.Http);
+  if (httpCandidates.length > 0) {
+    return httpCandidates;
+  }
+
+  return spans.filter((span) => span.type === SpanType.Function);
+}
+
+function childrenByParentId(spans: readonly Span[]): ReadonlyMap<string, readonly Span[]> {
+  const children = new Map<string, Span[]>();
+
+  for (const span of spans) {
+    if (span.parentId === null) {
+      continue;
+    }
+
+    const existing = children.get(span.parentId) ?? [];
+    existing.push(span);
+    children.set(span.parentId, existing);
+  }
+
+  return children;
+}
+
+function descendantSpans(span: Span, childrenByParent: ReadonlyMap<string, readonly Span[]>): readonly Span[] {
+  const descendants: Span[] = [];
+  const stack = [...(childrenByParent.get(span.id) ?? [])].reverse();
+  const seenSpanIds = new Set<string>();
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (current === undefined || seenSpanIds.has(current.id)) {
+      continue;
+    }
+
+    seenSpanIds.add(current.id);
+    descendants.push(current);
+    stack.push(...[...(childrenByParent.get(current.id) ?? [])].reverse());
+  }
+
+  return descendants;
 }
 
 function testCases(trace: Trace, options: GenerateTestsOptions): readonly GeneratedTestCase[] {
-  const selectedSpans = functionSpans(trace);
+  const spans = flattenedTraceSpans(trace);
+  const selectedSpans = callableSpans(spans);
   if (selectedSpans.length === 0) {
-    throw new Error('Cannot generate replay tests from a trace with no function spans.');
+    throw new Error('Cannot generate replay tests from a trace with no callable function or HTTP spans.');
   }
+  const childSpanMap = childrenByParentId(spans);
 
   return selectedSpans.map((span) => ({
     spanId: span.id,
     name: span.name,
     functionName: options.functionName ?? span.name,
     input: serializedValue(span.input),
-    output: serializedValue(span.output)
+    output: serializedValue(span.output),
+    sideEffects: sideEffectsForCase(span, childSpanMap)
   }));
 }
 
@@ -134,11 +229,19 @@ function sideEffectForSpan(span: Span): ExpectedSideEffect | undefined {
   return undefined;
 }
 
-function expectedSideEffects(trace: Trace): readonly ExpectedSideEffect[] {
-  return trace.spans.flatMap((span) => {
+function expectedSideEffects(spans: readonly Span[]): readonly ExpectedSideEffect[] {
+  return spans.flatMap((span) => {
     const sideEffect = sideEffectForSpan(span);
     return sideEffect === undefined ? [] : [sideEffect];
   });
+}
+
+function sideEffectsForCase(span: Span, childrenByParent: ReadonlyMap<string, readonly Span[]>): readonly ExpectedSideEffect[] {
+  const relatedSpans = span.type === SpanType.Http || span.type === SpanType.Db
+    ? [span, ...descendantSpans(span, childrenByParent)]
+    : descendantSpans(span, childrenByParent);
+
+  return expectedSideEffects(relatedSpans);
 }
 
 function frameworkImport(framework: TestGenerationFramework): string {
@@ -165,6 +268,7 @@ type __GhostTraceTestCase = {
   readonly functionName: string;
   readonly input: unknown;
   readonly output: unknown;
+  readonly sideEffects: readonly __GhostTraceExpectedSideEffect[];
 };
 
 type __GhostTraceExpectedSideEffect = {
@@ -484,7 +588,7 @@ function sideEffectAssertionLines(assertSideEffects: boolean): readonly string[]
   }
 
   return [
-    '    for (const __ghosttraceExpectedSideEffect of __ghosttraceExpectedSideEffects) {',
+    '    for (const __ghosttraceExpectedSideEffect of __ghosttraceCase.sideEffects) {',
     '      const __ghosttraceSideEffectMatched = __ghosttraceReplayResult.spansMatched.some((match) =>',
     '        __ghosttraceSideEffectMatches(match.span, __ghosttraceExpectedSideEffect)',
     '      );',
@@ -522,13 +626,11 @@ export function generateTests(trace: Trace, options: GenerateTestsOptions = {}):
   const assertionStyle = normalizeAssertionStyle(options.assertionStyle);
   const modulePath = options.modulePath ?? './subject.js';
   const cases = testCases(trace, options);
-  const sideEffects = expectedSideEffects(trace);
   const sections = [
     header(framework, modulePath),
     RUNTIME_HELPERS,
     `const __ghosttraceTrace = ${jsonLiteral(generatedTrace(trace))} as const satisfies Trace;`,
     `const __ghosttraceTestCases = ${jsonLiteral(cases)} as const satisfies readonly __GhostTraceTestCase[];`,
-    `const __ghosttraceExpectedSideEffects = ${jsonLiteral(sideEffects)} as const satisfies readonly __GhostTraceExpectedSideEffect[];`,
     [
       `describe(${singleQuotedStringLiteral(`GhostTrace replay: ${trace.name}`)}, () => {`,
       cases.map((testCase, index) => testCaseCode(testCase, index, assertionStyle, options.assertSideEffects ?? false)).join('\n\n'),

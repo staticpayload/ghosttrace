@@ -234,9 +234,39 @@ function isAsyncSpan(span: Span): boolean {
   return false;
 }
 
+function outputRecordValue(output: Readonly<Record<string, unknown>>, key: string): unknown {
+  return output[key];
+}
+
 function outputValue(span: Span): unknown {
-  if ((span.type === SpanType.Db || span.type === SpanType.Queue || span.type === SpanType.Fs) && isRecord(span.output) && 'result' in span.output) {
-    return span.output.result;
+  if (!isRecord(span.output)) {
+    return span.output;
+  }
+
+  if (span.type === SpanType.Env && 'value' in span.output) {
+    return outputRecordValue(span.output, 'value');
+  }
+
+  if (span.type === SpanType.Timer) {
+    if ('result' in span.output) {
+      return outputRecordValue(span.output, 'result');
+    }
+    if ('value' in span.output) {
+      return outputRecordValue(span.output, 'value');
+    }
+  }
+
+  if (span.type === SpanType.Fs) {
+    if ('result' in span.output) {
+      return outputRecordValue(span.output, 'result');
+    }
+    if (span.output.success === true) {
+      return undefined;
+    }
+  }
+
+  if ((span.type === SpanType.Db || span.type === SpanType.Queue) && 'result' in span.output) {
+    return outputRecordValue(span.output, 'result');
   }
 
   return span.output;

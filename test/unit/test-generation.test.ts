@@ -4,6 +4,7 @@ import {
   SpanType,
   TRACE_FORMAT_VERSION,
   generateTests,
+  serialize,
   type GenerateTestsOptions,
   type Span,
   type SpanError,
@@ -69,6 +70,77 @@ function sampleTrace(): Trace {
       output: { status: 200, body: { id: 1 } }
     })
   ]);
+}
+
+function syntheticRootMultiCaseTrace(): Trace {
+  return trace([
+    span({
+      id: 'span_root',
+      type: SpanType.Function,
+      name: 'recordedFlow',
+      input: [],
+      output: { ok: true },
+      metadata: { traceName: 'recorded-flow' }
+    }),
+    span({
+      id: 'span_case_a',
+      parentId: 'span_root',
+      type: SpanType.Function,
+      name: 'lookupUser',
+      input: [1],
+      output: { id: 1 }
+    }),
+    span({
+      id: 'span_http_a',
+      parentId: 'span_case_a',
+      type: SpanType.Http,
+      name: 'fetch',
+      input: { method: 'GET', url: 'https://api.example.test/users/1' },
+      output: { status: 200, body: { id: 1 } }
+    }),
+    span({
+      id: 'span_case_b',
+      parentId: 'span_root',
+      type: SpanType.Function,
+      name: 'lookupUser',
+      input: [2],
+      output: { id: 2 }
+    }),
+    span({
+      id: 'span_http_b',
+      parentId: 'span_case_b',
+      type: SpanType.Http,
+      name: 'fetch',
+      input: { method: 'GET', url: 'https://api.example.test/users/2' },
+      output: { status: 200, body: { id: 2 } }
+    })
+  ]);
+}
+
+function extractGeneratedConst(source: string, constName: string): unknown {
+  const marker = `const ${constName} = `;
+  const start = source.indexOf(marker);
+  expect(start).toBeGreaterThanOrEqual(0);
+
+  const valueStart = start + marker.length;
+  const valueEnd = source.indexOf(' as const', valueStart);
+  expect(valueEnd).toBeGreaterThan(valueStart);
+
+  return JSON.parse(source.slice(valueStart, valueEnd)) as unknown;
+}
+
+function expectRecord(value: unknown): Readonly<Record<string, unknown>> {
+  expect(value).toBeTypeOf('object');
+  expect(value).not.toBeNull();
+  expect(Array.isArray(value)).toBe(false);
+  return value as Readonly<Record<string, unknown>>;
+}
+
+function expectedSideEffects(value: unknown): readonly Readonly<Record<string, unknown>>[] {
+  const record = expectRecord(value);
+  expect(record.sideEffects).toBeTypeOf('object');
+  expect(Array.isArray(record.sideEffects)).toBe(true);
+  return record.sideEffects as readonly Readonly<Record<string, unknown>>[];
 }
 
 function expectValidTypeScript(source: string): void {
@@ -144,9 +216,80 @@ describe('generateTests', () => {
     });
 
     expectValidTypeScript(source);
-    expect(source).toContain('const __ghosttraceExpectedSideEffects = [');
+    expect(source).toContain('"sideEffects": [');
     expect(source).toContain('"url": "https://api.example.test/users/1"');
     expect(source).toContain('__ghosttraceReplayResult.spansMatched.some');
     expect(source).toContain('expect(__ghosttraceSideEffectMatched).toBe(true);');
+  });
+
+  it('uses callable child function spans instead of the synthetic recorder root for test arguments', () => {
+    const source = generateTests(trace([
+      span({
+        id: 'span_root',
+        type: SpanType.Function,
+        name: 'recordedFlow',
+        input: [],
+        output: { value: 'root-output' },
+        metadata: { traceName: 'recorded-flow' }
+      }),
+      span({
+        id: 'span_child',
+        parentId: 'span_root',
+        type: SpanType.Function,
+        name: 'calculate',
+        input: [7, 8],
+        output: 15
+      })
+    ]), {
+      framework: 'vitest',
+      assertionStyle: 'deep-equal',
+      modulePath: './calculator.js'
+    });
+
+    expectValidTypeScript(source);
+    const cases = extractGeneratedConst(source, '__ghosttraceTestCases');
+    expect(cases).toEqual([
+      {
+        spanId: 'span_child',
+        name: 'calculate',
+        functionName: 'calculate',
+        input: serialize([7, 8]),
+        output: 15,
+        sideEffects: []
+      }
+    ]);
+    expect(source).toContain("__ghosttraceInvokeTracedFunction('calculate'");
+  });
+
+  it('scopes expected side effects to the generated test case that owns each child span', () => {
+    const source = generateTests(syntheticRootMultiCaseTrace(), {
+      framework: 'vitest',
+      assertionStyle: 'deep-equal',
+      modulePath: './users.js',
+      assertSideEffects: true
+    });
+
+    expectValidTypeScript(source);
+    const cases = extractGeneratedConst(source, '__ghosttraceTestCases');
+    expect(Array.isArray(cases)).toBe(true);
+    const [firstCase, secondCase] = cases as readonly unknown[];
+
+    expect(expectedSideEffects(firstCase)).toEqual([
+      {
+        type: 'http',
+        name: 'fetch',
+        url: 'https://api.example.test/users/1',
+        method: 'GET'
+      }
+    ]);
+    expect(expectedSideEffects(secondCase)).toEqual([
+      {
+        type: 'http',
+        name: 'fetch',
+        url: 'https://api.example.test/users/2',
+        method: 'GET'
+      }
+    ]);
+    expect(source).toContain('for (const __ghosttraceExpectedSideEffect of __ghosttraceCase.sideEffects)');
   });
 });
