@@ -44,6 +44,7 @@ import { replay as replayTrace } from './replay/index.js';
 import { generateMocks } from './mock/index.js';
 import { generateFixtures } from './fixture/index.js';
 import { generateTests } from './regression/index.js';
+import { exportJson, exportMarkdown, exportMermaid } from './export/index.js';
 import { diff as diffTraces, type DiffOptions, type DiffResult } from './contract/diff.js';
 import {
   computeTraceChecksum,
@@ -185,6 +186,17 @@ export type {
   TestAssertionStyle,
   TestGenerationFramework
 } from './regression/index.js';
+export {
+  exportJson,
+  exportMarkdown,
+  exportMermaid
+} from './export/index.js';
+export type {
+  ExportJsonOptions,
+  ExportMermaidOptions,
+  JsonExportMode,
+  MermaidExportMode
+} from './export/index.js';
 export type {
   AddedSpanChange,
   ChangedFieldChange,
@@ -377,6 +389,9 @@ export const ghost = {
   generateMocks,
   generateFixtures,
   generateTests,
+  exportJson,
+  exportMarkdown,
+  exportMermaid,
   diff,
   validateTrace,
   computeTraceChecksum,
