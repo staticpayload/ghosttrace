@@ -42,6 +42,8 @@ import {
 import { record, registerInterceptor } from './recorder/index.js';
 import { replay as replayTrace } from './replay/index.js';
 import { generateMocks } from './mock/index.js';
+import { generateFixtures } from './fixture/index.js';
+import { generateTests } from './regression/index.js';
 import { diff as diffTraces, type DiffOptions, type DiffResult } from './contract/diff.js';
 import {
   computeTraceChecksum,
@@ -165,12 +167,24 @@ export type {
 } from './redaction/index.js';
 export { record, registerInterceptor } from './recorder/index.js';
 export { generateMocks } from './mock/index.js';
+export { generateFixtures } from './fixture/index.js';
+export { generateTests } from './regression/index.js';
 export type {
   GenerateMocksOptions,
   MockExhaustionBehavior,
   MockGenerationFilter,
   MockGenerationFormat
 } from './mock/index.js';
+export type {
+  FixtureGenerationFilter,
+  FixtureGenerationFormat,
+  GenerateFixturesOptions
+} from './fixture/index.js';
+export type {
+  GenerateTestsOptions,
+  TestAssertionStyle,
+  TestGenerationFramework
+} from './regression/index.js';
 export type {
   AddedSpanChange,
   ChangedFieldChange,
@@ -361,6 +375,8 @@ export const ghost = {
   record,
   replay,
   generateMocks,
+  generateFixtures,
+  generateTests,
   diff,
   validateTrace,
   computeTraceChecksum,
