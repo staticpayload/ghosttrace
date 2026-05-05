@@ -1,9 +1,22 @@
-import { getTraceContext, runWithSpanContext } from '../core/context.js';
+import { getTraceContext, runWithSpanContext, type TraceContext } from '../core/context.js';
 import { serialize } from '../core/serializer.js';
 import { SpanType, type Span, type SpanError } from '../core/types.js';
 import type { Interceptor, InterceptorContext, Teardown } from './types.js';
 
 const HTTP_SENTINEL = '__GHOSTTRACE_HTTP_INTERCEPTOR_SENTINEL__';
+
+interface ActiveHttpSession {
+  readonly addSpan: (span: Span) => void;
+}
+
+interface ActiveHttpContext {
+  readonly context: TraceContext;
+  readonly session: ActiveHttpSession;
+}
+
+const activeHttpSessions = new Map<string, ActiveHttpSession>();
+let originalFetch: typeof globalThis.fetch | undefined;
+let patchedFetch: typeof globalThis.fetch | undefined;
 
 function markHttpInterceptorBundled(): string {
   return HTTP_SENTINEL;
@@ -117,13 +130,22 @@ function spanErrorFromUnknown(error: unknown): SpanError {
   };
 }
 
-function pendingHttpSpan(input: unknown): Span | undefined {
+function activeHttpContext(): ActiveHttpContext | undefined {
   const context = getTraceContext();
 
   if (context === undefined || context.mode !== 'record') {
     return undefined;
   }
 
+  const session = activeHttpSessions.get(context.traceId);
+  if (session === undefined) {
+    return undefined;
+  }
+
+  return { context, session };
+}
+
+function pendingHttpSpan(context: TraceContext, input: unknown): Span {
   const startTime = context.clock.now();
 
   return {
@@ -142,9 +164,8 @@ function pendingHttpSpan(input: unknown): Span | undefined {
   };
 }
 
-function completeHttpSpan(span: Span, output: unknown, error: SpanError | null): Span {
-  const context = getTraceContext();
-  const endTime = context?.clock.now() ?? span.startTime;
+function completeHttpSpan(context: TraceContext, span: Span, output: unknown, error: SpanError | null): Span {
+  const endTime = context.clock.now();
 
   return {
     ...span,
@@ -156,35 +177,81 @@ function completeHttpSpan(span: Span, output: unknown, error: SpanError | null):
   };
 }
 
+function fetchImplementation(): typeof globalThis.fetch {
+  if (originalFetch === undefined) {
+    throw new TypeError('fetch is not available');
+  }
+
+  return originalFetch;
+}
+
+function installGlobalFetchPatch(): void {
+  if (patchedFetch !== undefined) {
+    return;
+  }
+
+  originalFetch = globalThis.fetch;
+  patchedFetch = async (input, init) => {
+    const active = activeHttpContext();
+    const fetch = fetchImplementation();
+
+    if (active === undefined) {
+      return fetch(input, init);
+    }
+
+    const span = pendingHttpSpan(active.context, fetchInputDetails(input, init));
+
+    try {
+      const response = await runWithSpanContext(span, () => fetch(input, init));
+      active.session.addSpan(completeHttpSpan(active.context, span, await responseOutput(response), null));
+      return response;
+    } catch (error) {
+      active.session.addSpan(completeHttpSpan(active.context, span, undefined, spanErrorFromUnknown(error)));
+      throw error;
+    }
+  };
+
+  globalThis.fetch = patchedFetch;
+}
+
+function restoreGlobalFetchPatchIfIdle(): void {
+  if (activeHttpSessions.size > 0 || patchedFetch === undefined) {
+    return;
+  }
+
+  if (globalThis.fetch === patchedFetch && originalFetch !== undefined) {
+    globalThis.fetch = originalFetch;
+  }
+
+  originalFetch = undefined;
+  patchedFetch = undefined;
+}
+
 /** HTTP interceptor that records fetch calls during an active recording context. */
 export const httpInterceptor: Interceptor = {
   name: 'http',
   install: (context: InterceptorContext): Teardown => {
     void markHttpInterceptorBundled();
-    const originalFetch = globalThis.fetch;
-    const patchedFetch: typeof globalThis.fetch = async (input, init) => {
-      const span = pendingHttpSpan(fetchInputDetails(input, init));
+    const traceContext = getTraceContext();
 
-      if (span === undefined) {
-        return originalFetch(input, init);
-      }
+    if (traceContext === undefined) {
+      return () => undefined;
+    }
 
-      try {
-        const response = await runWithSpanContext(span, () => originalFetch(input, init));
-        context.addSpan(completeHttpSpan(span, await responseOutput(response), null));
-        return response;
-      } catch (error) {
-        context.addSpan(completeHttpSpan(span, undefined, spanErrorFromUnknown(error)));
-        throw error;
-      }
-    };
+    activeHttpSessions.set(traceContext.traceId, {
+      addSpan: context.addSpan
+    });
+    installGlobalFetchPatch();
 
-    globalThis.fetch = patchedFetch;
+    let installed = true;
 
     return () => {
-      if (globalThis.fetch === patchedFetch) {
-        globalThis.fetch = originalFetch;
+      if (!installed) {
+        return;
       }
+      installed = false;
+      activeHttpSessions.delete(traceContext.traceId);
+      restoreGlobalFetchPatchIfIdle();
     };
   },
   isAvailable: (): boolean => typeof globalThis.fetch === 'function'

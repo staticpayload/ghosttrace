@@ -83,6 +83,26 @@ export interface Trace<TSpan extends Span = Span> {
   readonly metadata: TraceMetadata;
 }
 
+/** Options controlling where a recorded trace is saved. */
+export interface TraceSaveOptions {
+  /** Directory where the default sanitized trace filename should be written. */
+  readonly directory?: string;
+  /** Exact output file path. Takes precedence over directory when provided. */
+  readonly filePath?: string;
+}
+
+/** Destination accepted by a recorded trace's save method. */
+export type TraceSaveTarget = string | TraceSaveOptions;
+
+/** Saves a recorded trace and returns the file path written. */
+export type TraceSaveFunction = (target?: TraceSaveTarget) => Promise<string>;
+
+/** Trace returned by the recorder, augmented with persistence helpers. */
+export interface RecordedTrace<TSpan extends Span = Span> extends Trace<TSpan> {
+  /** Writes this trace to deterministic JSON, creating parent directories. */
+  readonly save: TraceSaveFunction;
+}
+
 /** Options used to create a Trace object in foundation builds. */
 export interface CreateTraceOptions<TSpan extends Span = Span> {
   /** Unique trace identifier. */
@@ -167,7 +187,7 @@ export interface Tracer {
     name: string,
     fn: TraceableFunction<TOutput>,
     options?: RecordOptions
-  ) => Promise<Trace>;
+  ) => Promise<RecordedTrace>;
   /** Replays a function using a trace object or trace file path. */
   readonly replay: <TOutput, TSpan extends Span = Span>(
     trace: Trace<TSpan> | string,

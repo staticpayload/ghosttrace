@@ -13,6 +13,7 @@ import {
 import { createTraceContext, getTraceContext, requireTraceContext, runWithSpanContext, runWithTraceContext } from './core/context.js';
 import { createVirtualClock } from './core/clock.js';
 import { createIdGenerator } from './core/id.js';
+import { defaultTraceFileName, sanitizeTraceNameForFilename, saveTrace } from './core/persistence.js';
 import { deserialize, serialize, stringifySerialized, writeSerializedJson } from './core/serializer.js';
 import {
   TRACE_FORMAT_VERSION,
@@ -56,6 +57,7 @@ export {
 } from './core/context.js';
 export { createVirtualClock, type VirtualClock, type VirtualClockOptions } from './core/clock.js';
 export { createIdGenerator, type DeterministicIdGenerator, type IdGeneratorOptions } from './core/id.js';
+export { defaultTraceFileName, sanitizeTraceNameForFilename, saveTrace } from './core/persistence.js';
 export {
   deserialize,
   serialize,
@@ -75,6 +77,7 @@ export {
   type GhostTraceConfig,
   type ReplayMatchStrategy,
   type ReplayMode,
+  type RecordedTrace,
   type RecordOptions,
   type ReplayOptions,
   type ReplayResult,
@@ -84,6 +87,9 @@ export {
   type ReplaySpanMatch,
   type Trace,
   type TraceMetadata,
+  type TraceSaveFunction,
+  type TraceSaveOptions,
+  type TraceSaveTarget,
   type TraceableFunction,
   type Tracer
 } from './core/types.js';
@@ -194,6 +200,9 @@ export const ghost = {
   runWithTraceContext,
   createVirtualClock,
   createIdGenerator,
+  defaultTraceFileName,
+  sanitizeTraceNameForFilename,
+  saveTrace,
   record,
   replay,
   serialize,

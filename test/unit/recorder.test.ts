@@ -10,6 +10,24 @@ import {
 
 const unregisterCallbacks: Array<() => void> = [];
 
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function collectSpans(spans: readonly Span[]): readonly Span[] {
+  return spans.flatMap((span) => [span, ...collectSpans(span.children)]);
+}
+
+function httpUrls(traceSpans: readonly Span[]): readonly string[] {
+  return traceSpans.flatMap((span) => {
+    if (span.type !== SpanType.Http || !isRecord(span.input) || typeof span.input.url !== 'string') {
+      return [];
+    }
+
+    return [span.input.url];
+  });
+}
+
 function spanWithTiming(
   id: string,
   type: SpanType,
@@ -217,6 +235,113 @@ describe('recording engine', () => {
     const startTimes = trace.spans.map((span) => span.startTime);
     expect(startTimes).toEqual([...startTimes].sort((left, right) => left - right));
     expect(trace.spans.every((span) => span.duration === span.endTime - span.startTime)).toBe(true);
+  });
+
+  it('enforces trace timing invariants for every span', async () => {
+    registerTestInterceptor({
+      name: 'outside-bounds',
+      install: (context: InterceptorContext) => {
+        context.addSpan({ ...spanWithTiming('outside', SpanType.Fs, 'outside', -5, -1), duration: 999 });
+        return () => undefined;
+      },
+      isAvailable: () => true
+    });
+
+    const trace = await ghost.record('timing-invariants', () => 'ok', {
+      interceptors: ['outside-bounds']
+    });
+    const allSpans = collectSpans(trace.spans);
+
+    expect(trace.duration).toBe(trace.endTime - trace.startTime);
+    expect(allSpans.every((span) => span.duration === span.endTime - span.startTime)).toBe(true);
+    expect(allSpans.every((span) => span.startTime >= trace.startTime)).toBe(true);
+    expect(allSpans.every((span) => span.endTime <= trace.endTime)).toBe(true);
+  });
+
+  it('keeps ten sequential recordings isolated', async () => {
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => new Response(`body:${String(input)}`));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const traces = [];
+    for (let index = 0; index < 10; index += 1) {
+      traces.push(
+        await ghost.record(
+          `sequential-${index}`,
+          async () => {
+            const response = await fetch(`https://example.test/sequential/${index}`);
+            return response.text();
+          },
+          { interceptors: ['http'] }
+        )
+      );
+    }
+
+    for (let index = 0; index < traces.length; index += 1) {
+      const trace = traces[index];
+      if (trace === undefined) {
+        throw new Error(`missing trace ${index}`);
+      }
+
+      expect(trace.name).toBe(`sequential-${index}`);
+      expect(trace.metadata.name).toBe(`sequential-${index}`);
+      expect(httpUrls(trace.spans)).toEqual([`https://example.test/sequential/${index}`]);
+      expect(trace.spans.every((span) => span.metadata.traceName !== `sequential-${index + 1}`)).toBe(true);
+    }
+    expect(fetchSpy).toHaveBeenCalledTimes(10);
+  });
+
+  it('keeps ten parallel recordings isolated while sharing monkey-patched fetch', async () => {
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => new Response(`body:${String(input)}`));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const traces = await Promise.all(
+      Array.from({ length: 10 }, async (_value, index) =>
+        ghost.record(
+          `parallel-${index}`,
+          async () => {
+            await Promise.resolve();
+            const response = await fetch(`https://example.test/parallel/${index}`);
+            return response.text();
+          },
+          { interceptors: ['http'] }
+        )
+      )
+    );
+
+    for (let index = 0; index < traces.length; index += 1) {
+      const trace = traces[index];
+      if (trace === undefined) {
+        throw new Error(`missing trace ${index}`);
+      }
+
+      expect(trace.name).toBe(`parallel-${index}`);
+      expect(trace.metadata.name).toBe(`parallel-${index}`);
+      expect(httpUrls(trace.spans)).toEqual([`https://example.test/parallel/${index}`]);
+      expect(trace.spans.every((span) => span.id.startsWith('span_'))).toBe(true);
+    }
+    expect(fetchSpy).toHaveBeenCalledTimes(10);
+  });
+
+  it('restores monkey-patched globals after a recorded function crashes', async () => {
+    const originalFetch = globalThis.fetch;
+    const originalDateNow = Date.now;
+    const originalRandom = Math.random;
+    const originalEnv = process.env;
+
+    const trace = await ghost.record(
+      'crash-restores-globals',
+      () => {
+        expect(globalThis.fetch).not.toBe(originalFetch);
+        throw new Error('crashed during recording');
+      },
+      { interceptors: ['http', 'function', 'fs'] }
+    );
+
+    expect(trace.spans[0]?.error).toMatchObject({ message: 'crashed during recording' });
+    expect(globalThis.fetch).toBe(originalFetch);
+    expect(Date.now).toBe(originalDateNow);
+    expect(Math.random).toBe(originalRandom);
+    expect(process.env).toBe(originalEnv);
   });
 
   it('captures broken interceptor failures as error spans and still completes recording', async () => {

@@ -1,9 +1,11 @@
 import { createTraceContext, runWithSpanContext, runWithTraceContext, type TraceContext } from '../core/context.js';
 import { RecordingError } from '../core/errors.js';
+import { attachTraceSave } from '../core/persistence.js';
 import { serialize } from '../core/serializer.js';
 import {
   SpanType,
   TRACE_FORMAT_VERSION,
+  type RecordedTrace,
   type RecordOptions,
   type Span,
   type SpanError,
@@ -145,10 +147,15 @@ function createErrorSpan(context: TraceContext, name: string, error: unknown, me
   };
 }
 
-function normalizeSpan(span: Span): Span {
+function normalizeSpan(span: Span, traceStartTime: number): Span {
+  const startTime = Math.max(traceStartTime, span.startTime);
+  const endTime = Math.max(startTime, span.endTime);
+
   return {
     ...span,
-    duration: span.endTime - span.startTime,
+    startTime,
+    endTime,
+    duration: endTime - startTime,
     children: []
   };
 }
@@ -175,9 +182,9 @@ function buildChildren(
   };
 }
 
-function buildChronologicalSpanTree(recordedSpans: readonly RecordedSpan[]): readonly Span[] {
+function buildChronologicalSpanTree(recordedSpans: readonly RecordedSpan[], traceStartTime: number): readonly Span[] {
   const sortedSpans = recordedSpans
-    .map(({ span, order }) => ({ span: normalizeSpan(span), order }))
+    .map(({ span, order }) => ({ span: normalizeSpan(span, traceStartTime), order }))
     .sort((left, right) => left.span.startTime - right.span.startTime || left.order - right.order);
   const spanIds = new Set(sortedSpans.map(({ span }) => span.id));
   const childrenByParentId = new Map<string, Span[]>();
@@ -278,7 +285,10 @@ function teardownInstalledInterceptors(
 }
 
 function traceEndTime(spans: readonly Span[], fallbackEndTime: number): number {
-  return spans.reduce((endTime, span) => Math.max(endTime, span.endTime), fallbackEndTime);
+  return spans.reduce(
+    (endTime, span) => Math.max(endTime, span.endTime, traceEndTime(span.children, endTime)),
+    fallbackEndTime
+  );
 }
 
 /** Registers an interceptor for future recording sessions and returns an unregister teardown. */
@@ -312,7 +322,7 @@ export async function record<TOutput>(
   name: string,
   fn: TraceableFunction<TOutput>,
   options: RecordOptions = {}
-): Promise<Trace> {
+): Promise<RecordedTrace> {
   const traceId = nextTraceId();
   const metadata = createRecordingMetadata(name, options.metadata);
   const baseContext = createTraceContext({ traceId, metadata });
@@ -351,16 +361,19 @@ export async function record<TOutput>(
   });
 
   const rootSpan = completeRootSpan(rootPendingSpan, rootEndTime, rootOutput, rootError);
-  const spans = buildChronologicalSpanTree([
-    {
-      span: rootSpan,
-      order: 0
-    },
-    ...recordedSpans
-  ]);
+  const spans = buildChronologicalSpanTree(
+    [
+      {
+        span: rootSpan,
+        order: 0
+      },
+      ...recordedSpans
+    ],
+    rootSpan.startTime
+  );
   const endTime = traceEndTime(spans, rootSpan.endTime);
 
-  return {
+  const trace: Trace = {
     id: traceId,
     name,
     version: TRACE_FORMAT_VERSION,
@@ -370,4 +383,6 @@ export async function record<TOutput>(
     spans,
     metadata
   };
+
+  return attachTraceSave(trace);
 }
