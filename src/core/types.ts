@@ -18,6 +18,9 @@ export enum SpanType {
 /** Arbitrary metadata stored on traces and spans. */
 export type TraceMetadata = Readonly<Record<string, unknown>>;
 
+/** Arbitrary metadata stored on individual spans. */
+export type SpanMetadata = Readonly<Record<string, unknown>>;
+
 /** Serializable error details captured on a span. */
 export interface SpanError {
   /** Error class or constructor name. */
@@ -28,6 +31,8 @@ export interface SpanError {
   readonly stack?: string;
   /** Optional machine-readable error code. */
   readonly code?: string;
+  /** Optional nested error cause when the runtime provided one. */
+  readonly cause?: SpanError;
 }
 
 /** A recorded unit of work or side-effectful operation. */
@@ -55,7 +60,7 @@ export interface Span<TInput = unknown, TOutput = unknown> {
   /** Captured error details, or null when the operation succeeded. */
   readonly error: SpanError | null;
   /** Operation-specific metadata. */
-  readonly metadata: TraceMetadata;
+  readonly metadata: SpanMetadata;
 }
 
 /** A complete deterministic execution trace. */
@@ -117,17 +122,33 @@ export interface RecordOptions {
 /** Options accepted by the foundation replay API placeholder. */
 export interface ReplayOptions {
   /** Replay mode selected by future replay-engine features. */
-  readonly mode?: 'strict' | 'lenient' | 'partial';
+  readonly mode?: ReplayMode;
   /** Span types replayed when mode is partial. */
   readonly replayTypes?: readonly SpanType[];
 }
 
+/** Replay strategy used to associate a runtime call with a recorded span. */
+export type ReplayMatchStrategy = 'exact' | 'input' | 'sequential';
+
+/** Replay modes supported by the replay engine. */
+export type ReplayMode = 'strict' | 'lenient' | 'partial';
+
+/** One span matched during replay, including the strategy used. */
+export interface ReplaySpanMatch<TSpan extends Span = Span> {
+  /** Recorded span selected for the runtime call. */
+  readonly span: TSpan;
+  /** Matching strategy used to select the span. */
+  readonly strategy: ReplayMatchStrategy;
+  /** Zero-based sequence for the matched runtime call. */
+  readonly sequence: number;
+}
+
 /** Result returned by future replay operations with generic output inference. */
-export interface ReplayResult<TOutput = unknown> {
+export interface ReplayResult<TOutput = unknown, TSpan extends Span = Span> {
   /** Function output produced during replay. */
   readonly output: TOutput;
   /** Spans matched during replay. */
-  readonly spansMatched: readonly Span[];
+  readonly spansMatched: readonly ReplaySpanMatch<TSpan>[];
   /** Original trace duration in milliseconds. */
   readonly originalDuration: number;
   /** Replay execution duration in milliseconds. */
