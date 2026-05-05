@@ -41,6 +41,7 @@ import {
 } from './redaction/index.js';
 import { record, registerInterceptor } from './recorder/index.js';
 import { replay as replayTrace } from './replay/index.js';
+import { generateMocks } from './mock/index.js';
 import { diff as diffTraces, type DiffOptions, type DiffResult } from './contract/diff.js';
 import {
   computeTraceChecksum,
@@ -163,6 +164,13 @@ export type {
   RedactionRegexRule
 } from './redaction/index.js';
 export { record, registerInterceptor } from './recorder/index.js';
+export { generateMocks } from './mock/index.js';
+export type {
+  GenerateMocksOptions,
+  MockExhaustionBehavior,
+  MockGenerationFilter,
+  MockGenerationFormat
+} from './mock/index.js';
 export type {
   AddedSpanChange,
   ChangedFieldChange,
@@ -352,6 +360,7 @@ export const ghost = {
   normalizeRedactionOptions,
   record,
   replay,
+  generateMocks,
   diff,
   validateTrace,
   computeTraceChecksum,
