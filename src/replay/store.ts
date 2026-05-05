@@ -1,6 +1,8 @@
 import { ReplayExhaustedError } from '../core/errors.js';
+import { deserialize, serialize, type SerializedJsonValue } from '../core/serializer.js';
 import {
   SpanType,
+  type ReplayMatchStrategy,
   type ReplayMode,
   type ReplayOptions,
   type ReplaySpanMatch,
@@ -36,6 +38,156 @@ function spanKey(type: SpanType, name: string): string {
   return `${type}:${name}`;
 }
 
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function recordValue(value: unknown, key: string): unknown {
+  return isRecord(value) ? value[key] : undefined;
+}
+
+function deepEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) {
+    return true;
+  }
+
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+      return false;
+    }
+
+    return left.every((item, index) => deepEqual(item, right[index]));
+  }
+
+  if (!isRecord(left) || !isRecord(right)) {
+    return false;
+  }
+
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+
+  if (leftKeys.length !== rightKeys.length) {
+    return false;
+  }
+
+  return leftKeys.every((key, index) => key === rightKeys[index] && deepEqual(left[key], right[key]));
+}
+
+function deserializeSpanInput(input: unknown): unknown {
+  return deserialize(input as SerializedJsonValue);
+}
+
+function envInputIdentity(input: unknown): Record<string, unknown> | undefined {
+  const operation = recordValue(input, 'operation');
+  const key = recordValue(input, 'key');
+
+  if (typeof key !== 'string') {
+    return undefined;
+  }
+
+  const identity: Record<string, unknown> = { key };
+  if (typeof operation === 'string') {
+    identity.operation = operation;
+  }
+
+  return identity;
+}
+
+function timerSetInputIdentity(input: unknown): Record<string, unknown> | undefined {
+  const operation = recordValue(input, 'operation');
+  const delay = recordValue(input, 'delay');
+  const callbackName = recordValue(input, 'callbackName');
+
+  if (typeof operation !== 'string' || typeof delay !== 'number') {
+    return undefined;
+  }
+
+  const identity: Record<string, unknown> = {
+    operation,
+    delay
+  };
+
+  if (typeof callbackName === 'string') {
+    identity.callbackName = callbackName;
+  }
+
+  return identity;
+}
+
+function timerClearInputIdentity(input: unknown): Record<string, unknown> | undefined {
+  const operation = recordValue(input, 'operation');
+  const timerId = recordValue(input, 'timerId');
+
+  if (typeof operation !== 'string' || typeof timerId !== 'string') {
+    return undefined;
+  }
+
+  return {
+    operation,
+    timerId
+  };
+}
+
+function timerOperationInputIdentity(input: unknown): Record<string, unknown> | undefined {
+  const operation = recordValue(input, 'operation');
+
+  if (typeof operation !== 'string') {
+    return undefined;
+  }
+
+  return { operation };
+}
+
+function timerInputIdentity(name: string, input: unknown): Record<string, unknown> | undefined {
+  switch (name) {
+    case 'setTimeout':
+    case 'setInterval':
+      return timerSetInputIdentity(input);
+    case 'clearTimeout':
+    case 'clearInterval':
+      return timerClearInputIdentity(input);
+    default:
+      return timerOperationInputIdentity(input);
+  }
+}
+
+function recordedInputIdentity(type: SpanType, name: string, input: unknown): unknown | undefined {
+  switch (type) {
+    case SpanType.Env:
+      return envInputIdentity(deserializeSpanInput(input));
+    case SpanType.Timer:
+      return timerInputIdentity(name, deserializeSpanInput(input));
+    case SpanType.Random:
+      return undefined;
+    default:
+      return input;
+  }
+}
+
+function actualInputIdentity(type: SpanType, name: string, input: unknown): unknown | undefined {
+  switch (type) {
+    case SpanType.Env:
+      return envInputIdentity(input);
+    case SpanType.Timer:
+      return timerInputIdentity(name, input);
+    case SpanType.Random:
+      return undefined;
+    default:
+      return serialize(input);
+  }
+}
+
+function inputMatches(type: SpanType, name: string, span: Span, actualInput: unknown): boolean {
+  const recordedIdentity = recordedInputIdentity(type, name, span.input);
+  const actualIdentity = actualInputIdentity(type, name, actualInput);
+
+  if (recordedIdentity === undefined || actualIdentity === undefined) {
+    return false;
+  }
+
+  return deepEqual(recordedIdentity, actualIdentity);
+}
+
 function replayMode(options: ReplayOptions): ReplayMode {
   return options.mode ?? 'strict';
 }
@@ -69,10 +221,78 @@ export function createReplayStore<TSpan extends Span>(
   const mode = replayMode(options);
   const selectedTypes = replayTypes(options, mode);
   const spansByKey = indexTraceSpans(trace);
-  const consumedByKey = new Map<string, number>();
+  const runtimeSequenceByKey = new Map<string, number>();
+  const consumedIndexesByKey = new Map<string, Set<number>>();
   const matches: ReplaySpanMatch<TSpan>[] = [];
 
   const canReplay = (type: SpanType): boolean => selectedTypes === null || selectedTypes.has(type);
+
+  const isConsumed = (key: string, index: number): boolean => consumedIndexesByKey.get(key)?.has(index) ?? false;
+
+  const markConsumed = (key: string, index: number): void => {
+    const consumedIndexes = consumedIndexesByKey.get(key) ?? new Set<number>();
+    consumedIndexes.add(index);
+    consumedIndexesByKey.set(key, consumedIndexes);
+  };
+
+  const firstUnconsumedIndex = (key: string, spans: readonly TSpan[]): number | undefined => {
+    for (let index = 0; index < spans.length; index += 1) {
+      if (!isConsumed(key, index)) {
+        return index;
+      }
+    }
+
+    return undefined;
+  };
+
+  const inputMatchedIndex = (
+    key: string,
+    spans: readonly TSpan[],
+    type: SpanType,
+    name: string,
+    input: unknown
+  ): number | undefined => {
+    for (let index = 0; index < spans.length; index += 1) {
+      if (!isConsumed(key, index) && inputMatches(type, name, spans[index] as Span, input)) {
+        return index;
+      }
+    }
+
+    return undefined;
+  };
+
+  const selectSpan = (
+    key: string,
+    spans: readonly TSpan[],
+    sequence: number,
+    type: SpanType,
+    name: string,
+    input: unknown
+  ): { readonly index: number; readonly strategy: ReplayMatchStrategy } | undefined => {
+    const sequenceSpan = spans[sequence];
+    if (sequenceSpan !== undefined && !isConsumed(key, sequence) && inputMatches(type, name, sequenceSpan, input)) {
+      return {
+        index: sequence,
+        strategy: 'exact'
+      };
+    }
+
+    const matchedByInput = inputMatchedIndex(key, spans, type, name, input);
+    if (matchedByInput !== undefined) {
+      return {
+        index: matchedByInput,
+        strategy: 'input'
+      };
+    }
+
+    const sequentialIndex = firstUnconsumedIndex(key, spans);
+    return sequentialIndex === undefined
+      ? undefined
+      : {
+          index: sequentialIndex,
+          strategy: 'sequential'
+        };
+  };
 
   const consumeSpan = (type: SpanType, name: string, input: unknown): ReplayConsumption<TSpan> | undefined => {
     if (!canReplay(type)) {
@@ -80,10 +300,11 @@ export function createReplayStore<TSpan extends Span>(
     }
 
     const key = spanKey(type, name);
-    const sequence = consumedByKey.get(key) ?? 0;
-    const span = spansByKey.get(key)?.[sequence];
+    const sequence = runtimeSequenceByKey.get(key) ?? 0;
+    const spans = spansByKey.get(key) ?? [];
+    const selectedSpan = selectSpan(key, spans, sequence, type, name, input);
 
-    if (span === undefined) {
+    if (selectedSpan === undefined) {
       if (mode === 'lenient') {
         return undefined;
       }
@@ -99,10 +320,12 @@ export function createReplayStore<TSpan extends Span>(
       });
     }
 
-    consumedByKey.set(key, sequence + 1);
+    const span = spans[selectedSpan.index] as TSpan;
+    runtimeSequenceByKey.set(key, sequence + 1);
+    markConsumed(key, selectedSpan.index);
     matches.push({
       span,
-      strategy: 'sequential',
+      strategy: selectedSpan.strategy,
       sequence
     });
 

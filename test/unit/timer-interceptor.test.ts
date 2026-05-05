@@ -150,4 +150,42 @@ describe('timer interceptor', () => {
     expect(replayed.spansMatched.map((match) => match.span.name)).toEqual(['Date.now', 'Date.now', 'new Date']);
     expect(Date).toBe(originalDate);
   });
+
+  it('matches replayed timers by delay and callback identity when scheduling order changes', async () => {
+    let firedCallbacks: string[] = [];
+    function firstTimerCallback(): void {
+      firedCallbacks.push('first');
+    }
+    function secondTimerCallback(): void {
+      firedCallbacks.push('second');
+    }
+
+    const trace = await ghost.record(
+      'timer-reordered-replay',
+      () => {
+        const first = setTimeout(firstTimerCallback, 60_001);
+        const second = setTimeout(secondTimerCallback, 60_002);
+        pendingTimerHandles.push(first, second);
+
+        return 'recorded';
+      },
+      { interceptors: ['timer'] }
+    );
+
+    firedCallbacks = [];
+    const replayed = await ghost.replay(trace, () => {
+      setTimeout(secondTimerCallback, 60_002);
+      setTimeout(firstTimerCallback, 60_001);
+
+      return [...firedCallbacks];
+    });
+
+    expect(replayed.output).toEqual(['second', 'first']);
+    expect(replayed.spansMatched.map((match) => recordValue(match.span.input, 'delay'))).toEqual([60_002, 60_001]);
+    expect(replayed.spansMatched.map((match) => recordValue(match.span.input, 'callbackName'))).toEqual([
+      'secondTimerCallback',
+      'firstTimerCallback'
+    ]);
+    expect(replayed.spansMatched.map((match) => match.strategy)).toEqual(['input', 'input']);
+  });
 });

@@ -2,7 +2,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { SpanType, deserialize, ghost, type SerializedJsonValue, type Span } from '../../src/index.js';
 
 const ENV_KEY = 'GHOSTTRACE_ENV_INTERCEPTOR_TEST_VALUE';
-let originalValue: string | undefined = process.env[ENV_KEY];
+const ENV_REORDERED_FIRST_KEY = 'GHOSTTRACE_ENV_INTERCEPTOR_REORDERED_FIRST';
+const ENV_REORDERED_SECOND_KEY = 'GHOSTTRACE_ENV_INTERCEPTOR_REORDERED_SECOND';
+const envKeys = [ENV_KEY, ENV_REORDERED_FIRST_KEY, ENV_REORDERED_SECOND_KEY] as const;
+const originalValues = new Map<string, string | undefined>(envKeys.map((key) => [key, process.env[key]]));
 
 function envSpans(spans: readonly Span[]): readonly Span[] {
   return spans.filter((span) => span.type === SpanType.Env);
@@ -16,14 +19,31 @@ function deserializeAs<TValue>(value: unknown): TValue {
   return deserialize(value as SerializedJsonValue) as TValue;
 }
 
+function restoreEnvValue(key: string): void {
+  const originalValue = originalValues.get(key);
+
+  if (originalValue === undefined) {
+    delete process.env[key];
+  } else {
+    process.env[key] = originalValue;
+  }
+}
+
+function spanInputKey(span: Span | undefined): unknown {
+  const input = span?.input;
+
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    return undefined;
+  }
+
+  return (input as Readonly<Record<string, unknown>>).key;
+}
+
 describe('environment interceptor', () => {
   afterEach(() => {
-    if (originalValue === undefined) {
-      delete process.env[ENV_KEY];
-    } else {
-      process.env[ENV_KEY] = originalValue;
+    for (const key of envKeys) {
+      restoreEnvValue(key);
     }
-    originalValue = process.env[ENV_KEY];
   });
 
   it('records process.env reads, writes, and deletes with operation metadata', async () => {
@@ -125,5 +145,37 @@ describe('environment interceptor', () => {
     ]);
     expect(process.env).toBe(originalEnv);
     expect(process.env[ENV_KEY]).toBe('actual-replay-value');
+  });
+
+  it('matches replayed env reads by key when access order changes', async () => {
+    process.env[ENV_REORDERED_FIRST_KEY] = 'recorded-first';
+    process.env[ENV_REORDERED_SECOND_KEY] = 'recorded-second';
+
+    const trace = await ghost.record(
+      'env-reordered-replay',
+      () => ({
+        first: process.env[ENV_REORDERED_FIRST_KEY],
+        second: process.env[ENV_REORDERED_SECOND_KEY]
+      }),
+      { interceptors: ['env'] }
+    );
+
+    process.env[ENV_REORDERED_FIRST_KEY] = 'actual-first';
+    process.env[ENV_REORDERED_SECOND_KEY] = 'actual-second';
+
+    const replayed = await ghost.replay(trace, () => ({
+      second: process.env[ENV_REORDERED_SECOND_KEY],
+      first: process.env[ENV_REORDERED_FIRST_KEY]
+    }));
+
+    expect(replayed.output).toEqual({
+      second: 'recorded-second',
+      first: 'recorded-first'
+    });
+    expect(replayed.spansMatched.map((match) => spanInputKey(match.span))).toEqual([
+      ENV_REORDERED_SECOND_KEY,
+      ENV_REORDERED_FIRST_KEY
+    ]);
+    expect(replayed.spansMatched.map((match) => match.strategy)).toEqual(['input', 'input']);
   });
 });
