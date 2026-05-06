@@ -18,6 +18,8 @@ export interface GhostVitestOptions {
   readonly traceDir?: string;
   /** Interceptors to enable while recording. */
   readonly interceptors?: RecordOptions['interceptors'];
+  /** Plugins applied during fixture recording and replay lifecycle operations. */
+  readonly plugins?: RecordOptions['plugins'];
 }
 
 /** Function used to force a baseline update immediately or for the next recorded flow. */

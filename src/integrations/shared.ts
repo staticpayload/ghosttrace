@@ -18,6 +18,8 @@ export interface GhostFrameworkTraceOptions {
   readonly traceDir?: string;
   /** Interceptors to enable while recording. */
   readonly interceptors?: RecordOptions['interceptors'];
+  /** Plugins applied during framework recording and replay lifecycle operations. */
+  readonly plugins?: RecordOptions['plugins'];
 }
 
 /** Function used to force a baseline update immediately or for the next recorded flow. */
@@ -138,18 +140,43 @@ function recordOptionsForFramework(
   traceFile: string,
   options: GhostFrameworkTraceOptions
 ): RecordOptions {
-  const metadata = {
-    framework,
-    traceFile
+  const recordOptions: {
+    metadata: Readonly<Record<string, string>>;
+    interceptors?: NonNullable<RecordOptions['interceptors']>;
+    plugins?: NonNullable<RecordOptions['plugins']>;
+  } = {
+    metadata: {
+      framework,
+      traceFile
+    }
   };
 
-  if (options.interceptors === undefined) {
-    return { metadata };
+  if (options.interceptors !== undefined) {
+    recordOptions.interceptors = options.interceptors;
+  }
+  if (options.plugins !== undefined) {
+    recordOptions.plugins = options.plugins;
+  }
+
+  return recordOptions;
+}
+
+function replayOptionsForFramework(
+  options: GhostFrameworkTraceOptions,
+  replayOptions: ReplayOptions
+): ReplayOptions {
+  const plugins = [
+    ...(options.plugins ?? []),
+    ...(replayOptions.plugins ?? [])
+  ];
+
+  if (plugins.length === 0) {
+    return replayOptions;
   }
 
   return {
-    interceptors: options.interceptors,
-    metadata
+    ...replayOptions,
+    plugins
   };
 }
 
@@ -232,7 +259,7 @@ export function createFrameworkRecordReplayContext(
       return recordBaseline(options.framework, traceName, traceFile, options.traceOptions, state, fn);
     }
 
-    return replayBaseline(baseline, traceFile, state, fn, replayOptions);
+    return replayBaseline(baseline, traceFile, state, fn, replayOptionsForFramework(options.traceOptions, replayOptions));
   };
 
   const update = (async <TOutput>(fn?: TraceableFunction<TOutput>): Promise<void | Awaited<TOutput>> => {

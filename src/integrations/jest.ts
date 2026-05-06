@@ -7,6 +7,8 @@ export interface GhostJestOptions {
   readonly traceDir?: string;
   /** Interceptors to enable while recording. */
   readonly interceptors?: RecordOptions['interceptors'];
+  /** Plugins applied during wrapper recording and replay lifecycle operations. */
+  readonly plugins?: RecordOptions['plugins'];
   /** Replay options used when an existing baseline is replayed. */
   readonly replay?: ReplayOptions;
 }

@@ -35,6 +35,7 @@ import {
   runTracePluginHooks
 } from '../plugins/index.js';
 import { normalizeRedactionOptions, redactTrace, redactValue } from '../redaction/index.js';
+import { withTraceChecksum } from '../validation/index.js';
 
 interface RecordedSpan {
   readonly span: Span;
@@ -512,5 +513,5 @@ export async function record<TOutput>(
     operation: 'record'
   });
 
-  return attachTraceSave(redactTrace(transformedTrace, redactionOptions));
+  return attachTraceSave(withTraceChecksum(redactTrace(transformedTrace, redactionOptions)));
 }
