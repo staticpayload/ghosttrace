@@ -281,6 +281,11 @@ function effectiveInterceptorRegistry(additionalInterceptors: readonly Intercept
   return registry;
 }
 
+/** Returns the names of interceptors currently available to recording sessions. */
+export function registeredInterceptorNames(additionalInterceptors: readonly Interceptor[] = []): readonly string[] {
+  return [...effectiveInterceptorRegistry(additionalInterceptors).keys()];
+}
+
 function selectedInterceptorNames(
   options: RecordOptions,
   registry: ReadonlyMap<string, Interceptor>

@@ -35,6 +35,7 @@ import {
 import { wrap, wrapModule } from './interceptors/function.js';
 import { wrapDb } from './interceptors/db.js';
 import { wrapQueue } from './interceptors/queue.js';
+import type { Interceptor } from './interceptors/types.js';
 import {
   normalizeRedactionOptions,
   redactTrace,
@@ -42,7 +43,7 @@ import {
   redactionPlaceholder,
   type RedactionOptions
 } from './redaction/index.js';
-import { record, registerInterceptor } from './recorder/index.js';
+import { record, registeredInterceptorNames, registerInterceptor } from './recorder/index.js';
 import { normalizePlugins, registerPlugin } from './plugins/index.js';
 import { replay as replayTrace } from './replay/index.js';
 import { generateMocks } from './mock/index.js';
@@ -61,6 +62,14 @@ import {
   type TraceValidationResult
 } from './validation/index.js';
 import { VERSION } from './version.js';
+
+const GHOSTTRACE_CONFIG_KEYS: ReadonlySet<string> = new Set([
+  'traceDir',
+  'interceptors',
+  'redaction',
+  'plugins',
+  'metadata'
+]);
 
 export { VERSION } from './version.js';
 export {
@@ -251,7 +260,161 @@ function cloneMetadata(metadata: TraceMetadata | undefined): TraceMetadata {
   return metadata === undefined ? {} : { ...metadata };
 }
 
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function configValidationError(message: string, context: Readonly<Record<string, unknown>> = {}): RecordingError {
+  return new RecordingError(message, {
+    code: 'GHOSTTRACE_CONFIG_INVALID',
+    context
+  });
+}
+
+function assertConfigRecord(config: unknown): Readonly<Record<string, unknown>> {
+  if (!isRecord(config)) {
+    throw configValidationError('GhostTrace config must be an object', {
+      actualType: config === null ? 'null' : typeof config
+    });
+  }
+
+  const unknownKeys = Object.keys(config).filter((key) => !GHOSTTRACE_CONFIG_KEYS.has(key));
+  if (unknownKeys.length > 0) {
+    throw configValidationError(`GhostTrace config contains unknown key(s): ${unknownKeys.join(', ')}`, {
+      keys: unknownKeys
+    });
+  }
+
+  return config;
+}
+
+function optionalStringConfigField(
+  config: Readonly<Record<string, unknown>>,
+  field: string
+): string | undefined {
+  const value = config[field];
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (typeof value !== 'string') {
+    throw configValidationError(`GhostTrace config ${field} must be a string`, {
+      field,
+      actualType: value === null ? 'null' : typeof value
+    });
+  }
+
+  return value;
+}
+
+function optionalMetadataConfigField(
+  config: Readonly<Record<string, unknown>>,
+  field: string
+): TraceMetadata | undefined {
+  const value = config[field];
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!isRecord(value)) {
+    throw configValidationError(`GhostTrace config ${field} must be an object`, {
+      field,
+      actualType: value === null ? 'null' : typeof value
+    });
+  }
+
+  return { ...value };
+}
+
+function optionalPluginConfigField(
+  config: Readonly<Record<string, unknown>>
+): readonly GhostTracePlugin[] | undefined {
+  const value = config.plugins;
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Array.isArray(value)) {
+    throw configValidationError('GhostTrace config plugins must be an array', {
+      field: 'plugins',
+      actualType: value === null ? 'null' : typeof value
+    });
+  }
+
+  return normalizePlugins(value as readonly GhostTracePlugin[]);
+}
+
+function pluginProvidedInterceptors(plugins: readonly GhostTracePlugin[] | undefined): readonly Interceptor[] {
+  return plugins?.flatMap((plugin) => plugin.interceptors ?? []) ?? [];
+}
+
+function optionalInterceptorConfigField(
+  config: Readonly<Record<string, unknown>>,
+  plugins: readonly GhostTracePlugin[] | undefined
+): readonly string[] | undefined {
+  const value = config.interceptors;
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Array.isArray(value)) {
+    throw configValidationError('GhostTrace config interceptors must be an array of strings', {
+      field: 'interceptors',
+      actualType: value === null ? 'null' : typeof value
+    });
+  }
+
+  const names = value.map((name, index) => {
+    if (typeof name !== 'string' || name.length === 0) {
+      throw configValidationError(`GhostTrace config interceptor at index ${index} must be a non-empty string`, {
+        field: 'interceptors',
+        index,
+        actualType: name === null ? 'null' : typeof name
+      });
+    }
+
+    return name;
+  });
+  const availableNames = registeredInterceptorNames(pluginProvidedInterceptors(plugins));
+  const availableNameSet = new Set(availableNames);
+
+  for (const name of names) {
+    if (!availableNameSet.has(name)) {
+      throw configValidationError(
+        `GhostTrace config interceptor "${name}" is not registered. Available interceptors: ${availableNames.join(', ')}`,
+        {
+          field: 'interceptors',
+          interceptor: name,
+          availableInterceptors: availableNames
+        }
+      );
+    }
+  }
+
+  return names;
+}
+
+function optionalRedactionConfigField(
+  config: Readonly<Record<string, unknown>>
+): RedactionOptions | undefined {
+  const value = config.redaction;
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!isRecord(value)) {
+    throw configValidationError('GhostTrace config redaction must be an object', {
+      field: 'redaction',
+      actualType: value === null ? 'null' : typeof value
+    });
+  }
+
+  return normalizeRedactionOptions(value as RedactionOptions);
+}
+
 function normalizeConfig(config: GhostTraceConfig): GhostTraceConfig {
+  const configRecord = assertConfigRecord(config);
+  const plugins = optionalPluginConfigField(configRecord);
   const normalized: {
     traceDir?: string;
     interceptors?: readonly string[];
@@ -260,20 +423,24 @@ function normalizeConfig(config: GhostTraceConfig): GhostTraceConfig {
     metadata?: TraceMetadata;
   } = {};
 
-  if (config.traceDir !== undefined) {
-    normalized.traceDir = config.traceDir;
+  const traceDir = optionalStringConfigField(configRecord, 'traceDir');
+  if (traceDir !== undefined) {
+    normalized.traceDir = traceDir;
   }
-  if (config.interceptors !== undefined) {
-    normalized.interceptors = [...config.interceptors];
+  const interceptors = optionalInterceptorConfigField(configRecord, plugins);
+  if (interceptors !== undefined) {
+    normalized.interceptors = interceptors;
   }
-  if (config.redaction !== undefined) {
-    normalized.redaction = normalizeRedactionOptions(config.redaction);
+  const redaction = optionalRedactionConfigField(configRecord);
+  if (redaction !== undefined) {
+    normalized.redaction = redaction;
   }
-  if (config.plugins !== undefined) {
-    normalized.plugins = normalizePlugins(config.plugins);
+  if (plugins !== undefined) {
+    normalized.plugins = plugins;
   }
-  if (config.metadata !== undefined) {
-    normalized.metadata = cloneMetadata(config.metadata);
+  const metadata = optionalMetadataConfigField(configRecord, 'metadata');
+  if (metadata !== undefined) {
+    normalized.metadata = metadata;
   }
 
   return normalized;
@@ -388,6 +555,11 @@ export function defineConfig(config: GhostTraceConfig = {}): GhostTraceConfig {
   return normalizeConfig(config);
 }
 
+/** Loads, validates, checksum-checks, and migrates a GhostTrace trace file. */
+export async function loadTrace<TSpan extends Span = Span>(path: string): Promise<Trace<TSpan>> {
+  return loadValidatedTrace<TSpan>(path, 'loadTrace');
+}
+
 /** Replays a function using a trace object or trace file path in future replay features. */
 export async function replay<TOutput, TSpan extends Span = Span>(
   trace: Trace<TSpan> | string,
@@ -497,6 +669,7 @@ export const ghost = {
   exportMarkdown,
   exportMermaid,
   exportTrace,
+  loadTrace,
   diff,
   validateTrace,
   computeTraceChecksum,
