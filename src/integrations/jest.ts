@@ -1,4 +1,5 @@
-import type { RecordOptions } from '../core/types.js';
+import type { RecordOptions, ReplayOptions } from '../core/types.js';
+import { createFrameworkRecordReplayContext } from './shared.js';
 
 /** Options accepted by the Jest integration entry point. */
 export interface GhostJestOptions {
@@ -6,6 +7,8 @@ export interface GhostJestOptions {
   readonly traceDir?: string;
   /** Interceptors to enable while recording. */
   readonly interceptors?: RecordOptions['interceptors'];
+  /** Replay options used when an existing baseline is replayed. */
+  readonly replay?: ReplayOptions;
 }
 
 /** Wraps a Jest test function while preserving its call signature. */
@@ -14,8 +17,13 @@ export function withGhostTrace<TArgs extends readonly unknown[], TOutput>(
   fn: (...args: TArgs) => TOutput | Promise<TOutput>,
   options: GhostJestOptions = {}
 ): (...args: TArgs) => Promise<Awaited<TOutput>> {
-  void testName;
-  void options;
+  const lifecycle = createFrameworkRecordReplayContext({
+    framework: 'jest',
+    fallbackTraceName: 'ghosttrace-jest-test',
+    testName,
+    traceOptions: options
+  });
 
-  return async (...args: TArgs): Promise<Awaited<TOutput>> => fn(...args) as Awaited<TOutput>;
+  return async (...args: TArgs): Promise<Awaited<TOutput>> =>
+    lifecycle.record(async () => fn(...args), options.replay ?? {});
 }

@@ -1,7 +1,7 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { SpanType, deserialize, ghost as ghostApi, type SerializedJsonValue, type Trace } from '../../src/index.js';
 import { ghostFixture } from '../../src/integrations/vitest.js';
 
@@ -122,6 +122,26 @@ describe('ghostFixture Vitest integration', () => {
 
     const savedTrace = readTrace(ghost.traceFile);
     expect(deserializeAs<string>(rootOutput(savedTrace))).toBe('after-marked-update');
+  });
+
+  ghostTest('re-records corrupted and deleted baselines with warnings instead of crashing', async ({ ghost }) => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    let warnings = '';
+
+    try {
+      await expect(ghost.record(() => 'vitest-initial-baseline')).resolves.toBe('vitest-initial-baseline');
+
+      writeFileSync(ghost.traceFile, '{ this is not valid JSON', 'utf8');
+      await expect(ghost.record(() => 'vitest-after-corruption')).resolves.toBe('vitest-after-corruption');
+
+      rmSync(ghost.traceFile, { force: true });
+      await expect(ghost.record(() => 'vitest-after-delete')).resolves.toBe('vitest-after-delete');
+      warnings = warnSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    expect(warnings).toMatch(/re-recording/i);
   });
 
   it('can validate traces created by the fixture', async () => {
