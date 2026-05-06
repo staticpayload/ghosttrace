@@ -174,6 +174,13 @@ function pathString(value: unknown): string {
   return String(value);
 }
 
+function normalizeFilePathForTrace(value: unknown): string {
+  return pathString(value)
+    .replace(/\\/gu, '/')
+    .replace(/^[A-Za-z]:\//u, '/')
+    .replace(/\/{2,}/gu, '/');
+}
+
 function isFunction(value: unknown): value is (...args: unknown[]) => unknown {
   return typeof value === 'function';
 }
@@ -325,10 +332,13 @@ function fsInput(operation: FsOperation, api: FsApi, args: readonly unknown[], t
   if (operation === 'rename') {
     input.oldPath = pathString(args[0]);
     input.newPath = pathString(args[1]);
+    input.normalizedOldPath = normalizeFilePathForTrace(args[0]);
+    input.normalizedNewPath = normalizeFilePathForTrace(args[1]);
     return input;
   }
 
   input.path = pathString(args[0]);
+  input.normalizedPath = normalizeFilePathForTrace(args[0]);
 
   if (operation === 'writeFile') {
     input.data = captureContent(args[1], writeEncoding(args), traceId);
@@ -516,8 +526,11 @@ function fsMetadata(entry: FsOperationEntry, api: FsApi, args: readonly unknown[
   if (entry.operation === 'rename') {
     base.oldPath = pathString(args[0]);
     base.newPath = pathString(args[1]);
+    base.normalizedOldPath = normalizeFilePathForTrace(args[0]);
+    base.normalizedNewPath = normalizeFilePathForTrace(args[1]);
   } else {
     base.path = pathString(args[0]);
+    base.normalizedPath = normalizeFilePathForTrace(args[0]);
   }
 
   return base;

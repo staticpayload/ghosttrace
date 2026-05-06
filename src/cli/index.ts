@@ -92,7 +92,11 @@ interface CliErrorOptions {
   readonly exitImmediately?: boolean;
 }
 
-interface RecordCommandOptions {
+interface ConfigurableCommandOptions {
+  readonly config?: unknown;
+}
+
+interface RecordCommandOptions extends ConfigurableCommandOptions {
   readonly args?: unknown;
   readonly output?: unknown;
   readonly timeout?: unknown;
@@ -100,33 +104,33 @@ interface RecordCommandOptions {
   readonly interceptors?: unknown;
 }
 
-interface ReplayCommandOptions {
+interface ReplayCommandOptions extends ConfigurableCommandOptions {
   readonly args?: unknown;
   readonly mode?: unknown;
   readonly replayTypes?: unknown;
   readonly timeout?: unknown;
 }
 
-interface DiffCommandOptions {
+interface DiffCommandOptions extends ConfigurableCommandOptions {
   readonly format?: unknown;
   readonly failOn?: unknown;
   readonly rules?: unknown;
   readonly output?: unknown;
 }
 
-interface ExportCommandOptions {
+interface ExportCommandOptions extends ConfigurableCommandOptions {
   readonly format?: unknown;
   readonly output?: unknown;
   readonly mode?: unknown;
 }
 
-interface InspectCommandOptions {
+interface InspectCommandOptions extends ConfigurableCommandOptions {
   readonly spans?: unknown;
   readonly span?: unknown;
   readonly validate?: unknown;
 }
 
-interface GenerateCommandOptions {
+interface GenerateCommandOptions extends ConfigurableCommandOptions {
   readonly framework?: unknown;
   readonly output?: unknown;
 }
@@ -136,6 +140,11 @@ interface PackageJsonLike {
   readonly devDependencies?: Readonly<Record<string, unknown>>;
   readonly peerDependencies?: Readonly<Record<string, unknown>>;
   readonly optionalDependencies?: Readonly<Record<string, unknown>>;
+}
+
+interface LoadedCliConfig {
+  readonly config: GhostTraceConfig;
+  readonly baseDirectory: string;
 }
 
 class CliError extends Error {
@@ -168,6 +177,7 @@ export function createCli(): CAC {
     .option('--timeout <ms>', 'Abort recording after the given timeout in milliseconds')
     .option('--name <name>', 'Trace name to store in the output file')
     .option('--interceptors <names>', 'Comma-separated interceptor names to enable')
+    .option('--config <path>', 'Load GhostTrace config from this path instead of auto-discovery')
     .action(async (file: string | undefined, exportName: string | undefined, options: RecordCommandOptions): Promise<void> => {
       await runRecordCommand(process.cwd(), file, exportName, options);
     });
@@ -178,6 +188,7 @@ export function createCli(): CAC {
     .option('--mode <mode>', 'Replay mode: strict, lenient, or partial')
     .option('--replay-types <types>', 'Comma-separated span types to replay in partial mode')
     .option('--timeout <ms>', 'Abort replay after the given timeout in milliseconds')
+    .option('--config <path>', 'Load GhostTrace config from this path instead of auto-discovery')
     .action(async (
       tracePath: string | undefined,
       file: string | undefined,
@@ -193,6 +204,7 @@ export function createCli(): CAC {
     .option('--fail-on <severity>', 'Exit 1 when the diff reaches severity: breaking, drift, any, or none')
     .option('--rules <path>', 'JSON diff rules file')
     .option('--output <path>', 'Write the diff report to a file instead of stdout')
+    .option('--config <path>', 'Load GhostTrace config from this path instead of auto-discovery')
     .action(async (
       baselinePath: string | undefined,
       currentPath: string | undefined,
@@ -206,6 +218,7 @@ export function createCli(): CAC {
     .option('--format <format>', 'Export format: json, markdown, mermaid, or html')
     .option('--output <path>', 'Write the export output to a file')
     .option('--mode <mode>', 'Formatter mode: pretty/compact for JSON, sequence/flowchart for Mermaid')
+    .option('--config <path>', 'Load GhostTrace config from this path instead of auto-discovery')
     .action(async (tracePath: string | undefined, options: ExportCommandOptions): Promise<void> => {
       await runExportCommand(process.cwd(), tracePath, options);
     });
@@ -215,6 +228,7 @@ export function createCli(): CAC {
     .option('--spans', 'List every span in the trace')
     .option('--span <id>', 'Show full detail for a specific span ID')
     .option('--validate', 'Validate trace schema and checksum integrity')
+    .option('--config <path>', 'Load GhostTrace config from this path instead of auto-discovery')
     .action(async (tracePath: string | undefined, options: InspectCommandOptions): Promise<void> => {
       await runInspectCommand(process.cwd(), tracePath, options);
     });
@@ -223,6 +237,7 @@ export function createCli(): CAC {
     .command('generate [kind] [trace]', 'Generate mocks, fixtures, or replay tests from a trace')
     .option('--framework <framework>', 'mocks: function/vitest/jest; fixtures: json/typescript; tests: vitest/jest')
     .option('--output <dir>', 'Directory for generated files')
+    .option('--config <path>', 'Load GhostTrace config from this path instead of auto-discovery')
     .action(async (kind: string | undefined, tracePath: string | undefined, options: GenerateCommandOptions): Promise<void> => {
       await runGenerateCommand(process.cwd(), kind, tracePath, options);
     });
@@ -495,15 +510,35 @@ function normalizeLoadedConfig(value: unknown, configPath: string): GhostTraceCo
   return defineConfig(config);
 }
 
-async function loadConfig(cwd: string): Promise<GhostTraceConfig> {
-  const configPath = await findConfig(cwd);
+async function resolveConfigPath(cwd: string, configOption: unknown): Promise<string | undefined> {
+  const overridePath = requireString(configOption, '--config');
+  if (overridePath === undefined) {
+    return findConfig(cwd);
+  }
+
+  const absoluteOverridePath = resolve(cwd, overridePath);
+  if (!(await pathExists(absoluteOverridePath))) {
+    throw new CliError(`Config file not found: ${overridePath}`);
+  }
+
+  return absoluteOverridePath;
+}
+
+async function loadCliConfig(cwd: string, configOption: unknown): Promise<LoadedCliConfig> {
+  const configPath = await resolveConfigPath(cwd, configOption);
   if (configPath === undefined) {
-    return {};
+    return {
+      config: {},
+      baseDirectory: cwd
+    };
   }
 
   const configModule = await importModule(configPath);
   const loadedConfig = resolveConfigExport(configModule);
-  return normalizeLoadedConfig(loadedConfig, configPath);
+  return {
+    config: normalizeLoadedConfig(loadedConfig, configPath),
+    baseDirectory: dirname(configPath)
+  };
 }
 
 function hasConfigKey(value: unknown): boolean {
@@ -793,13 +828,13 @@ function mockFormatFromFramework(framework: GenerateFramework): MockGenerationFo
   return 'function';
 }
 
-function outputDirectoryFromOptions(cwd: string, config: GhostTraceConfig, value: unknown): string | undefined {
+function outputDirectoryFromOptions(cwd: string, loadedConfig: LoadedCliConfig, value: unknown): string | undefined {
   const output = requireString(value, '--output');
   if (output !== undefined) {
     return resolve(cwd, output);
   }
-  if (config.traceDir !== undefined) {
-    return resolve(cwd, config.traceDir);
+  if (loadedConfig.config.traceDir !== undefined) {
+    return resolve(loadedConfig.baseDirectory, loadedConfig.config.traceDir);
   }
 
   return undefined;
@@ -1109,9 +1144,9 @@ async function recordTrace(
   return tracer.record(traceName, (() => wrappedTarget(...args)) as TraceableFunction<unknown>, options);
 }
 
-function defaultTraceSaveTarget(cwd: string, config: GhostTraceConfig): { readonly directory: string } {
+function defaultTraceSaveTarget(loadedConfig: LoadedCliConfig): { readonly directory: string } {
   return {
-    directory: resolve(cwd, config.traceDir ?? DEFAULT_TRACE_DIRECTORY)
+    directory: resolve(loadedConfig.baseDirectory, loadedConfig.config.traceDir ?? DEFAULT_TRACE_DIRECTORY)
   };
 }
 
@@ -1135,12 +1170,12 @@ async function runRecordCommand(
   const traceName = requireString(options.name, '--name') ?? exportName;
   const timeoutMs = parseTimeoutOption(options.timeout);
   const interceptors = parseInterceptorsOption(options.interceptors);
-  const config = await loadConfig(cwd);
+  const loadedConfig = await loadCliConfig(cwd, options.config);
   const moduleExports = await importModule(filePath);
   const targetFunction = assertTargetFunction(selectedExport(moduleExports, exportName), exportName);
 
-  const trace = await withTimeout(recordTrace(config, traceName, targetFunction, args, interceptors), timeoutMs);
-  const savedPath = await trace.save(output ?? defaultTraceSaveTarget(cwd, config));
+  const trace = await withTimeout(recordTrace(loadedConfig.config, traceName, targetFunction, args, interceptors), timeoutMs);
+  const savedPath = await trace.save(output ?? defaultTraceSaveTarget(loadedConfig));
 
   console.log(pc.green(`Trace saved to ${resolve(cwd, savedPath)}`));
 }
@@ -1165,6 +1200,7 @@ async function runReplayCommand(
   const mode = parseReplayModeOption(options.mode) ?? 'strict';
   const replayTypes = parseReplayTypesOption(options.replayTypes);
   const timeoutMs = parseTimeoutOption(options.timeout);
+  await loadCliConfig(cwd, options.config);
   const trace = await loadValidatedTrace(resolve(cwd, tracePath), 'replay');
   const expectedSpan = findReplayExpectationSpan(trace);
   const moduleExports = await importModule(filePath);
@@ -1248,6 +1284,7 @@ async function runDiffCommand(
   const format = parseDiffFormatOption(options.format);
   const failOn = parseDiffFailOnOption(options.failOn);
   const output = requireString(options.output, '--output');
+  await loadCliConfig(cwd, options.config);
   const rules = await loadDiffRules(cwd, options.rules);
   const baselineTrace = await loadValidatedTrace(resolve(cwd, baselinePath), 'baseline');
   const currentTrace = await loadValidatedTrace(resolve(cwd, currentPath), 'current');
@@ -1280,6 +1317,7 @@ async function runExportCommand(
   const format = parseExportFormatOption(options.format);
   const output = requireString(options.output, '--output');
   const mode = parseExportModeOption(format, options.mode);
+  await loadCliConfig(cwd, options.config);
   const trace = await loadValidatedTrace(resolve(cwd, tracePath), 'export');
   const exportOptions: {
     format: TraceExportFormat;
@@ -1398,6 +1436,7 @@ async function runInspectCommand(
   }
 
   const absoluteTracePath = resolve(cwd, tracePath);
+  await loadCliConfig(cwd, options.config);
   if (isEnabledFlag(options.validate)) {
     const validationResult = await validateTrace(absoluteTracePath);
     process.stdout.write(renderValidationResult(tracePath, validationResult));
@@ -1466,9 +1505,9 @@ async function runGenerateCommand(
     throw new CliError('Usage: ghost generate <mocks|fixtures|tests> <trace> [--framework name] [--output dir]');
   }
 
-  const config = await loadConfig(cwd);
-  const framework = parseGenerateFramework(kind, options.framework, config);
-  const outputDirectory = outputDirectoryFromOptions(cwd, config, options.output);
+  const loadedConfig = await loadCliConfig(cwd, options.config);
+  const framework = parseGenerateFramework(kind, options.framework, loadedConfig.config);
+  const outputDirectory = outputDirectoryFromOptions(cwd, loadedConfig, options.output);
   const trace = await loadValidatedTrace(resolve(cwd, tracePath), 'generate');
 
   if (kind === 'mocks') {

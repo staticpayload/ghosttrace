@@ -54,6 +54,13 @@ describe('GhostTrace error hierarchy', () => {
     expect(error.context).toEqual({ operation: 'unit-test' });
     expect(error.stack).toEqual(expect.any(String));
     expect(error.stack).toContain('outer failure');
+    expect(Object.keys(error)).toEqual(expect.arrayContaining(['code', 'traceId', 'spanId', 'context']));
+    expect(JSON.parse(JSON.stringify(error))).toMatchObject({
+      code: expectedCode,
+      traceId: 'trace_0001',
+      spanId: 'span_0001',
+      context: { operation: 'unit-test' }
+    });
   });
 
   it('allows callers to override the default code while preserving subclass identity', () => {

@@ -254,6 +254,36 @@ function copyDefinedRecordValue(target: Record<string, unknown>, source: unknown
   }
 }
 
+function normalizeTracePath(value: unknown): unknown {
+  if (typeof value !== 'string') {
+    return value;
+  }
+
+  return value
+    .replace(/\\/gu, '/')
+    .replace(/^[A-Za-z]:\//u, '/')
+    .replace(/\/{2,}/gu, '/');
+}
+
+function copyPortablePathValue(
+  target: Record<string, unknown>,
+  source: unknown,
+  pathKey: string,
+  normalizedPathKey: string,
+  identityKey: string
+): void {
+  const normalizedPath = recordValue(source, normalizedPathKey);
+  if (typeof normalizedPath === 'string') {
+    target[identityKey] = normalizeTracePath(normalizedPath);
+    return;
+  }
+
+  const path = recordValue(source, pathKey);
+  if (path !== undefined) {
+    target[identityKey] = normalizeTracePath(path);
+  }
+}
+
 function fsInputIdentity(input: unknown): Record<string, unknown> | undefined {
   const operation = recordValue(input, 'operation');
   const api = recordValue(input, 'api');
@@ -268,12 +298,12 @@ function fsInputIdentity(input: unknown): Record<string, unknown> | undefined {
   };
 
   if (operation === 'rename') {
-    copyDefinedRecordValue(identity, input, 'oldPath');
-    copyDefinedRecordValue(identity, input, 'newPath');
+    copyPortablePathValue(identity, input, 'oldPath', 'normalizedOldPath', 'oldPath');
+    copyPortablePathValue(identity, input, 'newPath', 'normalizedNewPath', 'newPath');
     return identity;
   }
 
-  copyDefinedRecordValue(identity, input, 'path');
+  copyPortablePathValue(identity, input, 'path', 'normalizedPath', 'path');
   copyDefinedRecordValue(identity, input, 'options');
   copyDefinedRecordValue(identity, input, 'mode');
   return identity;

@@ -24,6 +24,10 @@ import {
   type Teardown
 } from '../interceptors/index.js';
 import { createPluginRuntime, pluginInterceptors, runTracePluginHooks } from '../plugins/index.js';
+import {
+  validateTrace as validateTraceInput,
+  type TraceValidationResult as IntegrityTraceValidationResult
+} from '../validation/index.js';
 import { createReplayStore } from './store.js';
 
 interface ReplayInterceptorEntry {
@@ -94,6 +98,11 @@ const VALID_SPAN_TYPE_SET: ReadonlySet<string> = new Set(VALID_SPAN_TYPE_VALUES)
 const VALID_OUTPUT_TYPE_VALUES = ['resolve', 'reject', 'return', 'throw'] as const;
 const VALID_OUTPUT_TYPE_SET: ReadonlySet<string> = new Set(VALID_OUTPUT_TYPE_VALUES);
 const OUTPUT_TYPE_REQUIRED_SPAN_TYPES: ReadonlySet<string> = new Set([SpanType.Db, SpanType.Queue]);
+const INTEGRITY_VALIDATION_ERROR_CODES: ReadonlySet<string> = new Set([
+  'TRACE_CHECKSUM_MISSING',
+  'TRACE_CHECKSUM_INVALID',
+  'TRACE_CHECKSUM_MISMATCH'
+]);
 const REQUIRED_SPAN_FIELDS = [
   'id',
   'parentId',
@@ -129,6 +138,31 @@ function traceShapeIssuesError(filePath: string, issues: readonly TraceValidatio
       message: issue.message
     }))
   });
+}
+
+function integrityIssuesError(filePath: string, result: IntegrityTraceValidationResult): TraceValidationError {
+  const reason = result.errors.map((error) => `${error.path} ${error.message}`).join('; ');
+
+  return traceShapeError(filePath, reason, {
+    validationErrors: result.errors.map((error) => ({
+      code: error.code,
+      path: error.path,
+      message: error.message
+    }))
+  });
+}
+
+function validatesWithIntegrity<TSpan extends Span>(
+  value: unknown,
+  filePath: string
+): Trace<TSpan> | unknown {
+  const result = validateTraceInput<TSpan>(value) as IntegrityTraceValidationResult<TSpan>;
+
+  if (!result.valid && result.errors.some((error) => INTEGRITY_VALIDATION_ERROR_CODES.has(error.code))) {
+    throw integrityIssuesError(filePath, result);
+  }
+
+  return result.valid && result.trace !== undefined ? result.trace : value;
 }
 
 function hasOwnProperty(value: Readonly<Record<string, unknown>>, key: string): boolean {
@@ -463,8 +497,9 @@ async function loadReplayTrace<TSpan extends Span>(
     });
   }
 
-  assertTraceShape<TSpan>(parsed, filePath, options);
-  return parsed;
+  const validatedTrace = validatesWithIntegrity<TSpan>(parsed, filePath);
+  assertTraceShape<TSpan>(validatedTrace, filePath, options);
+  return validatedTrace;
 }
 
 function shouldInstallReplayInterceptor(type: SpanType, options: ReplayOptions): boolean {
