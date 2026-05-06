@@ -4,6 +4,7 @@ import { createTraceContext, runWithTraceContext } from '../core/context.js';
 import { ReplayMismatchError, TraceValidationError } from '../core/errors.js';
 import {
   SpanType,
+  type GhostTraceConfig,
   type ReplayOptions,
   type ReplayResult,
   type Span,
@@ -22,6 +23,7 @@ import {
   type Interceptor,
   type Teardown
 } from '../interceptors/index.js';
+import { createPluginRuntime, pluginInterceptors, runTracePluginHooks } from '../plugins/index.js';
 import { createReplayStore } from './store.js';
 
 interface ReplayInterceptorEntry {
@@ -52,6 +54,18 @@ function nextReplaySessionId(traceId: string): string {
   return `${traceId}:replay:${sequence}`;
 }
 
+function configFromReplayOptions(options: ReplayOptions): GhostTraceConfig {
+  const config: {
+    plugins?: NonNullable<ReplayOptions['plugins']>;
+  } = {};
+
+  if (options.plugins !== undefined) {
+    config.plugins = options.plugins;
+  }
+
+  return config;
+}
+
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -63,6 +77,10 @@ function isNodeError(value: unknown): value is NodeJS.ErrnoException {
 interface TraceValidationIssue {
   readonly path: string;
   readonly message: string;
+}
+
+interface TraceShapeOptions {
+  readonly allowCustomSpanTypes?: boolean;
 }
 
 interface SpanReference {
@@ -205,7 +223,8 @@ function validateParentIdField(
 function validateSpanTypeField(
   span: Readonly<Record<string, unknown>>,
   path: string,
-  issues: TraceValidationIssue[]
+  issues: TraceValidationIssue[],
+  options: TraceShapeOptions
 ): void {
   if (!hasOwnProperty(span, 'type')) {
     return;
@@ -217,6 +236,10 @@ function validateSpanTypeField(
     return;
   }
   if (!VALID_SPAN_TYPE_SET.has(spanType)) {
+    if (options.allowCustomSpanTypes === true && spanType.length > 0) {
+      return;
+    }
+
     addValidationIssue(
       issues,
       `${path}.type`,
@@ -229,7 +252,8 @@ function validateChildrenField(
   span: Readonly<Record<string, unknown>>,
   path: string,
   issues: TraceValidationIssue[],
-  references: SpanReference[]
+  references: SpanReference[],
+  options: TraceShapeOptions
 ): void {
   if (!hasOwnProperty(span, 'children')) {
     return;
@@ -242,7 +266,7 @@ function validateChildrenField(
   }
 
   for (const [index, child] of children.entries()) {
-    validateSpanShape(child, `${path}.children[${index}]`, issues, references);
+    validateSpanShape(child, `${path}.children[${index}]`, issues, references, options);
   }
 }
 
@@ -308,7 +332,8 @@ function validateSpanShape(
   value: unknown,
   path: string,
   issues: TraceValidationIssue[],
-  references: SpanReference[]
+  references: SpanReference[],
+  options: TraceShapeOptions
 ): void {
   if (!isRecord(value)) {
     addValidationIssue(issues, path, `${path} must be an object`);
@@ -321,13 +346,13 @@ function validateSpanShape(
 
   validateStringField(value, path, 'id', issues, { nonEmpty: true });
   validateParentIdField(value, path, issues);
-  validateSpanTypeField(value, path, issues);
+  validateSpanTypeField(value, path, issues, options);
   validateStringField(value, path, 'name', issues);
   validateNumberField(value, path, 'startTime', issues);
   validateNumberField(value, path, 'endTime', issues);
   validateNumberField(value, path, 'duration', issues);
   validateOutputTypeField(value, path, issues);
-  validateChildrenField(value, path, issues, references);
+  validateChildrenField(value, path, issues, references, options);
   validateErrorField(value, path, issues);
   validateRecordField(value, path, 'metadata', issues);
   references.push(spanReference(value, path));
@@ -356,7 +381,11 @@ function validateParentReferences(references: readonly SpanReference[], issues: 
   }
 }
 
-function assertTraceShape<TSpan extends Span>(value: unknown, filePath: string): asserts value is Trace<TSpan> {
+function assertTraceShape<TSpan extends Span>(
+  value: unknown,
+  filePath: string,
+  options: TraceShapeOptions = {}
+): asserts value is Trace<TSpan> {
   const issues: TraceValidationIssue[] = [];
   const references: SpanReference[] = [];
 
@@ -380,7 +409,7 @@ function assertTraceShape<TSpan extends Span>(value: unknown, filePath: string):
       addValidationIssue(issues, 'trace.spans', 'trace.spans must be an array');
     } else {
       for (const [index, span] of value.spans.entries()) {
-        validateSpanShape(span, `trace.spans[${index}]`, issues, references);
+        validateSpanShape(span, `trace.spans[${index}]`, issues, references, options);
       }
     }
   }
@@ -393,7 +422,10 @@ function assertTraceShape<TSpan extends Span>(value: unknown, filePath: string):
   }
 }
 
-async function loadReplayTrace<TSpan extends Span>(filePath: string): Promise<Trace<TSpan>> {
+async function loadReplayTrace<TSpan extends Span>(
+  filePath: string,
+  options: TraceShapeOptions = {}
+): Promise<Trace<TSpan>> {
   let text: string;
 
   try {
@@ -431,7 +463,7 @@ async function loadReplayTrace<TSpan extends Span>(filePath: string): Promise<Tr
     });
   }
 
-  assertTraceShape<TSpan>(parsed, filePath);
+  assertTraceShape<TSpan>(parsed, filePath, options);
   return parsed;
 }
 
@@ -443,7 +475,14 @@ function shouldInstallReplayInterceptor(type: SpanType, options: ReplayOptions):
   return (options.replayTypes ?? []).includes(type);
 }
 
-function installReplayInterceptors(options: ReplayOptions): readonly Teardown[] {
+function shouldInstallPluginReplayInterceptor(options: ReplayOptions): boolean {
+  return options.mode !== 'partial';
+}
+
+function installReplayInterceptors(
+  options: ReplayOptions,
+  additionalInterceptors: readonly Interceptor[] = []
+): readonly Teardown[] {
   const teardowns: Teardown[] = [];
 
   for (const entry of replayInterceptors) {
@@ -452,6 +491,15 @@ function installReplayInterceptors(options: ReplayOptions): readonly Teardown[] 
     }
 
     teardowns.push(entry.interceptor.install({ addSpan: () => undefined }));
+  }
+  if (shouldInstallPluginReplayInterceptor(options)) {
+    for (const interceptor of additionalInterceptors) {
+      if (!interceptor.isAvailable()) {
+        continue;
+      }
+
+      teardowns.push(interceptor.install({ addSpan: () => undefined }));
+    }
   }
 
   return teardowns;
@@ -542,11 +590,34 @@ export async function replay<TOutput, TSpan extends Span = Span>(
   fn: TraceableFunction<TOutput>,
   options: ReplayOptions = {}
 ): Promise<ReplayResult<Awaited<TOutput>, TSpan>> {
-  const trace = typeof traceInput === 'string' ? await loadReplayTrace<TSpan>(traceInput) : traceInput;
+  const pluginRuntimeOptions: {
+    plugins?: NonNullable<ReplayOptions['plugins']>;
+    pluginContext?: NonNullable<ReplayOptions['pluginContext']>;
+    config: GhostTraceConfig;
+  } = {
+    config: configFromReplayOptions(options)
+  };
+  if (options.plugins !== undefined) {
+    pluginRuntimeOptions.plugins = options.plugins;
+  }
+  if (options.pluginContext !== undefined) {
+    pluginRuntimeOptions.pluginContext = options.pluginContext;
+  }
+  const pluginRuntime = createPluginRuntime(pluginRuntimeOptions);
+  const additionalPluginInterceptors = pluginInterceptors(pluginRuntime);
+  const traceShapeOptions = {
+    allowCustomSpanTypes: additionalPluginInterceptors.length > 0
+  };
+  const loadedTrace = typeof traceInput === 'string'
+    ? await loadReplayTrace<TSpan>(traceInput, traceShapeOptions)
+    : traceInput;
   if (typeof traceInput !== 'string') {
-    assertTraceShape<TSpan>(trace, '<trace object>');
+    assertTraceShape<TSpan>(loadedTrace, '<trace object>', traceShapeOptions);
   }
   const timeout = normalizeReplayTimeout(options.timeout);
+  const trace = await runTracePluginHooks(pluginRuntime, 'beforeReplay', loadedTrace, {
+    operation: 'replay'
+  }) as Trace<TSpan>;
 
   const replayStore = createReplayStore(trace, options);
   const context = createTraceContext({
@@ -560,7 +631,7 @@ export async function replay<TOutput, TSpan extends Span = Span>(
   let output: Awaited<TOutput>;
 
   await runWithTraceContext(context, async () => {
-    const teardowns = installReplayInterceptors(options);
+    const teardowns = installReplayInterceptors(options, additionalPluginInterceptors);
 
     try {
       output = await executeWithReplayTimeout(trace, fn, timeout);
@@ -579,6 +650,9 @@ export async function replay<TOutput, TSpan extends Span = Span>(
           );
         }
       }
+      await runTracePluginHooks(pluginRuntime, 'afterReplay', trace, {
+        operation: 'replay'
+      });
     } finally {
       teardownReplayInterceptors(teardowns);
     }

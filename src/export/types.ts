@@ -1,5 +1,5 @@
 import type { DiffResult } from '../contract/diff.js';
-import { SpanType, type Trace } from '../core/types.js';
+import { SpanType, type GhostTracePlugin, type PluginRuntimeContext, type Trace } from '../core/types.js';
 
 /** JSON output density used by exportJson(). */
 export type JsonExportMode = 'pretty' | 'compact';
@@ -65,6 +65,10 @@ export interface ExportTraceOptions extends ExportPipelineOptions, ExportHtmlOpt
   readonly format: TraceExportFormat;
   /** Optional output file path. When omitted, the formatted string is returned. */
   readonly output?: string;
+  /** Plugins to apply before formatting. */
+  readonly plugins?: readonly GhostTracePlugin[];
+  /** Internal plugin runtime context supplied by createTracer(). */
+  readonly pluginContext?: PluginRuntimeContext;
   /** Convenience mode forwarded to JSON or Mermaid formatters. */
   readonly mode?: JsonExportMode | MermaidExportMode;
   /** Format-specific JSON options. */

@@ -3,8 +3,9 @@ import { dirname } from 'node:path';
 
 import type { DiffResult } from '../contract/diff.js';
 import { ExportError } from '../core/errors.js';
-import { type Span, type Trace } from '../core/types.js';
+import { type GhostTraceConfig, type Span, type Trace } from '../core/types.js';
 import { toSerializableTrace } from '../validation/canonical.js';
+import { createPluginRuntime, runTracePluginHooks } from '../plugins/index.js';
 import { exportHtml } from './html.js';
 import { exportJson, exportMarkdown, exportMermaid } from './formatters.js';
 import { cloneSpan, cloneTrace, collectUniqueSpans } from './shared.js';
@@ -20,6 +21,18 @@ import type {
 } from './types.js';
 
 const EXPORT_FORMATS: readonly TraceExportFormat[] = ['json', 'markdown', 'mermaid', 'html'];
+
+function configFromExportOptions(options: ExportTraceOptions): GhostTraceConfig {
+  const config: {
+    plugins?: NonNullable<ExportTraceOptions['plugins']>;
+  } = {};
+
+  if (options.plugins !== undefined) {
+    config.plugins = options.plugins;
+  }
+
+  return config;
+}
 
 function normalizeExportFormat(trace: Trace, format: TraceExportFormat | string): TraceExportFormat {
   if (EXPORT_FORMATS.includes(format as TraceExportFormat)) {
@@ -160,11 +173,29 @@ async function writeExportFile(trace: Trace, outputPath: string, content: string
 /** Runs the export pipeline and either returns the formatted string or writes it to the configured output path. */
 export async function exportTrace(trace: Trace, options: ExportTraceOptions): Promise<string> {
   const format = normalizeExportFormat(trace, options.format);
+  const pluginRuntimeOptions: {
+    plugins?: NonNullable<ExportTraceOptions['plugins']>;
+    pluginContext?: NonNullable<ExportTraceOptions['pluginContext']>;
+    config: GhostTraceConfig;
+  } = {
+    config: configFromExportOptions(options)
+  };
+  if (options.plugins !== undefined) {
+    pluginRuntimeOptions.plugins = options.plugins;
+  }
+  if (options.pluginContext !== undefined) {
+    pluginRuntimeOptions.pluginContext = options.pluginContext;
+  }
+  const pluginRuntime = createPluginRuntime(pluginRuntimeOptions);
   const pipelineTrace = applyExportPipeline(trace, options);
-  const content = exportTraceContent(pipelineTrace, options, format);
+  const exportReadyTrace = await runTracePluginHooks(pluginRuntime, 'beforeExport', pipelineTrace, {
+    operation: 'export',
+    format
+  });
+  const content = exportTraceContent(exportReadyTrace, options, format);
 
   if (options.output !== undefined) {
-    return writeExportFile(pipelineTrace, options.output, content);
+    return writeExportFile(exportReadyTrace, options.output, content);
   }
 
   return content;

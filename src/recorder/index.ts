@@ -5,6 +5,7 @@ import { serialize } from '../core/serializer.js';
 import {
   SpanType,
   TRACE_FORMAT_VERSION,
+  type GhostTraceConfig,
   type RecordedTrace,
   type RecordOptions,
   type Span,
@@ -27,6 +28,12 @@ import {
   type InterceptorContext,
   type Teardown
 } from '../interceptors/index.js';
+import {
+  createPluginRuntime,
+  pluginInterceptors,
+  runBeforeRecordHooks,
+  runTracePluginHooks
+} from '../plugins/index.js';
 import { normalizeRedactionOptions, redactTrace, redactValue } from '../redaction/index.js';
 
 interface RecordedSpan {
@@ -89,6 +96,30 @@ function createRecordingMetadata(name: string, metadata: TraceMetadata | undefin
     name,
     recordedAt: nextRecordedAt()
   };
+}
+
+function configFromRecordOptions(options: RecordOptions): GhostTraceConfig {
+  const config: {
+    interceptors?: readonly string[];
+    redaction?: NonNullable<RecordOptions['redaction']>;
+    plugins?: NonNullable<RecordOptions['plugins']>;
+    metadata?: TraceMetadata;
+  } = {};
+
+  if (options.interceptors !== undefined) {
+    config.interceptors = options.interceptors;
+  }
+  if (options.redaction !== undefined) {
+    config.redaction = options.redaction;
+  }
+  if (options.plugins !== undefined) {
+    config.plugins = options.plugins;
+  }
+  if (options.metadata !== undefined) {
+    config.metadata = options.metadata;
+  }
+
+  return config;
 }
 
 function spanErrorFromUnknown(error: unknown): SpanError {
@@ -240,8 +271,21 @@ function buildChronologicalSpanTree(
   return sortedSpans.map(({ span }) => buildChildren(span, childrenByParentId, new Set()));
 }
 
-function selectedInterceptorNames(options: RecordOptions): readonly string[] {
-  const names = options.interceptors ?? [...interceptorRegistry.keys()];
+function effectiveInterceptorRegistry(additionalInterceptors: readonly Interceptor[]): ReadonlyMap<string, Interceptor> {
+  const registry = new Map(interceptorRegistry);
+
+  for (const interceptor of additionalInterceptors) {
+    registry.set(interceptor.name, interceptor);
+  }
+
+  return registry;
+}
+
+function selectedInterceptorNames(
+  options: RecordOptions,
+  registry: ReadonlyMap<string, Interceptor>
+): readonly string[] {
+  const names = options.interceptors ?? [...registry.keys()];
   return [...new Set(names)];
 }
 
@@ -277,13 +321,15 @@ function addInterceptorErrorSpan(
 function installSelectedInterceptors(
   context: TraceContext,
   addSpan: (span: Span) => void,
-  options: RecordOptions
+  options: RecordOptions,
+  additionalInterceptors: readonly Interceptor[] = []
 ): readonly InstalledInterceptor[] {
   const installed: InstalledInterceptor[] = [];
   const interceptorContext = createInterceptorContext(addSpan);
+  const registry = effectiveInterceptorRegistry(additionalInterceptors);
 
-  for (const name of selectedInterceptorNames(options)) {
-    const interceptor = interceptorRegistry.get(name);
+  for (const name of selectedInterceptorNames(options, registry)) {
+    const interceptor = registry.get(name);
 
     if (interceptor === undefined) {
       addInterceptorErrorSpan(context, addSpan, name, 'missing', new RecordingError(`Interceptor "${name}" is not registered`, {
@@ -375,6 +421,22 @@ export async function record<TOutput>(
   options: RecordOptions = {}
 ): Promise<RecordedTrace> {
   const redactionOptions = normalizeRedactionOptions(options.redaction);
+  const pluginRuntimeOptions: {
+    plugins?: NonNullable<RecordOptions['plugins']>;
+    pluginContext?: NonNullable<RecordOptions['pluginContext']>;
+    config: GhostTraceConfig;
+  } = {
+    config: configFromRecordOptions(options)
+  };
+  if (options.plugins !== undefined) {
+    pluginRuntimeOptions.plugins = options.plugins;
+  }
+  if (options.pluginContext !== undefined) {
+    pluginRuntimeOptions.pluginContext = options.pluginContext;
+  }
+  const pluginRuntime = createPluginRuntime(pluginRuntimeOptions);
+  await runBeforeRecordHooks(pluginRuntime);
+
   const traceId = nextTraceId();
   const metadata = createRecordingMetadata(name, options.metadata);
   const baseContext = createTraceContext({ traceId, metadata });
@@ -398,7 +460,12 @@ export async function record<TOutput>(
   };
 
   await runWithTraceContext(context, async () => {
-    const installedInterceptors = installSelectedInterceptors(context, addSpan, options);
+    const installedInterceptors = installSelectedInterceptors(
+      context,
+      addSpan,
+      options,
+      pluginInterceptors(pluginRuntime)
+    );
 
     try {
       const output = await runWithSpanContext(rootPendingSpan, fn);
@@ -436,6 +503,9 @@ export async function record<TOutput>(
     spans,
     metadata
   };
+  const transformedTrace = await runTracePluginHooks(pluginRuntime, 'afterRecord', trace, {
+    operation: 'record'
+  });
 
-  return attachTraceSave(redactTrace(trace, redactionOptions));
+  return attachTraceSave(redactTrace(transformedTrace, redactionOptions));
 }

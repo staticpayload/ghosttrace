@@ -20,10 +20,13 @@ import {
   SpanType,
   type CreateTraceOptions,
   type GhostTraceConfig,
+  type GhostTracePlugin,
+  type PluginRuntimeContext,
   type RecordOptions,
   type ReplayOptions,
   type ReplayResult,
   type Span,
+  type TracerExportOptions,
   type Trace,
   type TraceMetadata,
   type TraceableFunction,
@@ -40,11 +43,12 @@ import {
   type RedactionOptions
 } from './redaction/index.js';
 import { record, registerInterceptor } from './recorder/index.js';
+import { normalizePlugins, registerPlugin } from './plugins/index.js';
 import { replay as replayTrace } from './replay/index.js';
 import { generateMocks } from './mock/index.js';
 import { generateFixtures } from './fixture/index.js';
 import { generateTests } from './regression/index.js';
-import { exportHtml, exportJson, exportMarkdown, exportMermaid, exportTrace } from './export/index.js';
+import { exportHtml, exportJson, exportMarkdown, exportMermaid, exportTrace, type ExportTraceOptions } from './export/index.js';
 import { diff as diffTraces, type DiffOptions, type DiffResult } from './contract/diff.js';
 import {
   computeTraceChecksum,
@@ -102,6 +106,11 @@ export {
   SpanType,
   type CreateTraceOptions,
   type GhostTraceConfig,
+  type GhostTracePlugin,
+  type PluginHookContext,
+  type PluginHooks,
+  type PluginRuntimeContext,
+  type PluginState,
   type RecordOptions,
   type ReplayMatchStrategy,
   type ReplayMode,
@@ -118,6 +127,7 @@ export {
   type TraceSaveOptions,
   type TraceSaveTarget,
   type TraceableFunction,
+  type TracerExportOptions,
   type Tracer
 } from './core/types.js';
 export type {
@@ -167,6 +177,7 @@ export type {
   RedactionRegexRule
 } from './redaction/index.js';
 export { record, registerInterceptor } from './recorder/index.js';
+export { registerPlugin } from './plugins/index.js';
 export { generateMocks } from './mock/index.js';
 export { generateFixtures } from './fixture/index.js';
 export { generateTests } from './regression/index.js';
@@ -245,6 +256,7 @@ function normalizeConfig(config: GhostTraceConfig): GhostTraceConfig {
     traceDir?: string;
     interceptors?: readonly string[];
     redaction?: RedactionOptions;
+    plugins?: readonly GhostTracePlugin[];
     metadata?: TraceMetadata;
   } = {};
 
@@ -256,6 +268,9 @@ function normalizeConfig(config: GhostTraceConfig): GhostTraceConfig {
   }
   if (config.redaction !== undefined) {
     normalized.redaction = normalizeRedactionOptions(config.redaction);
+  }
+  if (config.plugins !== undefined) {
+    normalized.plugins = normalizePlugins(config.plugins);
   }
   if (config.metadata !== undefined) {
     normalized.metadata = cloneMetadata(config.metadata);
@@ -269,6 +284,8 @@ function mergeRecordOptions(config: GhostTraceConfig, options: RecordOptions | u
     metadata?: TraceMetadata;
     interceptors?: readonly string[];
     redaction?: RedactionOptions;
+    plugins?: readonly GhostTracePlugin[];
+    pluginContext?: PluginRuntimeContext;
   } = {};
   const configMetadata = config.metadata ?? {};
   const optionMetadata = options?.metadata ?? {};
@@ -289,6 +306,59 @@ function mergeRecordOptions(config: GhostTraceConfig, options: RecordOptions | u
     merged.redaction = options.redaction;
   } else if (config.redaction !== undefined) {
     merged.redaction = config.redaction;
+  }
+  const mergedPlugins = [...(config.plugins ?? []), ...(options?.plugins ?? [])];
+  if (mergedPlugins.length > 0) {
+    merged.plugins = mergedPlugins;
+  }
+  if (options?.pluginContext !== undefined) {
+    merged.pluginContext = options.pluginContext;
+  }
+
+  return merged;
+}
+
+function mergeReplayOptions(config: GhostTraceConfig, options: ReplayOptions | undefined): ReplayOptions {
+  const merged: {
+    mode?: NonNullable<ReplayOptions['mode']>;
+    replayTypes?: NonNullable<ReplayOptions['replayTypes']>;
+    timeout?: number;
+    plugins?: readonly GhostTracePlugin[];
+    pluginContext?: PluginRuntimeContext;
+  } = {};
+
+  if (options?.mode !== undefined) {
+    merged.mode = options.mode;
+  }
+  if (options?.replayTypes !== undefined) {
+    merged.replayTypes = options.replayTypes;
+  }
+  if (options?.timeout !== undefined) {
+    merged.timeout = options.timeout;
+  }
+
+  const mergedPlugins = [...(config.plugins ?? []), ...(options?.plugins ?? [])];
+  if (mergedPlugins.length > 0) {
+    merged.plugins = mergedPlugins;
+  }
+  if (options?.pluginContext !== undefined) {
+    merged.pluginContext = options.pluginContext;
+  }
+
+  return merged;
+}
+
+function mergeTracerExportOptions(
+  config: GhostTraceConfig,
+  options: TracerExportOptions
+): ExportTraceOptions {
+  const merged = {
+    ...options,
+    plugins: [...(config.plugins ?? []), ...(options.plugins ?? [])]
+  } as ExportTraceOptions;
+
+  if (merged.plugins?.length === 0) {
+    delete (merged as { plugins?: readonly GhostTracePlugin[] }).plugins;
   }
 
   return merged;
@@ -365,13 +435,35 @@ export function diff(
 /** Returns an isolated GhostTrace API instance with captured configuration. */
 export function createTracer(config: GhostTraceConfig = {}): Tracer {
   const normalizedConfig = defineConfig(config);
+  let tracerApi: Tracer;
 
-  return {
+  tracerApi = {
     config: normalizedConfig,
-    record: (name, fn, options) => record(name, fn, mergeRecordOptions(normalizedConfig, options)),
-    replay,
+    record: (name, fn, options) => record(name, fn, {
+      ...mergeRecordOptions(normalizedConfig, options),
+      pluginContext: {
+        tracer: tracerApi,
+        config: normalizedConfig
+      }
+    }),
+    replay: (trace, fn, options) => replay(trace, fn, {
+      ...mergeReplayOptions(normalizedConfig, options),
+      pluginContext: {
+        tracer: tracerApi,
+        config: normalizedConfig
+      }
+    }),
+    exportTrace: (trace, options) => exportTrace(trace, {
+      ...mergeTracerExportOptions(normalizedConfig, options),
+      pluginContext: {
+        tracer: tracerApi,
+        config: normalizedConfig
+      }
+    }),
     defineConfig
   };
+
+  return tracerApi;
 }
 
 /** Public namespace mirroring the named GhostTrace exports. */
@@ -416,6 +508,7 @@ export const ghost = {
   stringifySerialized,
   writeSerializedJson,
   registerInterceptor,
+  registerPlugin,
   wrap,
   wrapDb,
   wrapModule,

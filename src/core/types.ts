@@ -1,4 +1,5 @@
 import type { RedactionOptions } from '../redaction/index.js';
+import type { Interceptor } from '../interceptors/types.js';
 
 /** Trace file format version emitted by this release. */
 export const TRACE_FORMAT_VERSION = '3.0.0' as const;
@@ -125,6 +126,61 @@ export interface CreateTraceOptions<TSpan extends Span = Span> {
   readonly metadata?: TraceMetadata;
 }
 
+/** Mutable per-plugin state bag isolated from every other plugin. */
+export type PluginState = Record<string, unknown>;
+
+/** Execution data made available to plugin lifecycle hooks. */
+export interface PluginHookContext<TState extends PluginState = PluginState> {
+  /** Plugin whose hook is currently running. */
+  readonly plugin: GhostTracePlugin<TState>;
+  /** State bag dedicated to this plugin registration. */
+  readonly pluginState: TState;
+  /** Tracer or tracer-like object associated with this lifecycle execution. */
+  readonly tracer: unknown;
+  /** Effective configuration visible to the lifecycle execution. */
+  readonly config: GhostTraceConfig;
+  /** Immutable trace copy visible to trace lifecycle hooks. */
+  readonly trace?: Trace;
+  /** Export format visible to beforeExport hooks. */
+  readonly format?: string;
+  /** Lifecycle surface currently invoking the hook. */
+  readonly operation: 'record' | 'replay' | 'export';
+}
+
+/** Lifecycle hooks supported by GhostTrace plugins. */
+export interface PluginHooks<TState extends PluginState = PluginState> {
+  /** Runs before a recording starts and before spans are created. */
+  readonly beforeRecord?: (context: PluginHookContext<TState>) => void | Promise<void>;
+  /** Runs after recording has produced a trace; returning a trace applies a transform. */
+  readonly afterRecord?: (trace: Trace, context: PluginHookContext<TState>) => Trace | void | Promise<Trace | void>;
+  /** Runs before replay starts; returning a trace changes the replay source trace. */
+  readonly beforeReplay?: (trace: Trace, context: PluginHookContext<TState>) => Trace | void | Promise<Trace | void>;
+  /** Runs after replay completes successfully. */
+  readonly afterReplay?: (trace: Trace, context: PluginHookContext<TState>) => Trace | void | Promise<Trace | void>;
+  /** Runs before export formatting; returning a trace changes formatter input. */
+  readonly beforeExport?: (trace: Trace, context: PluginHookContext<TState>) => Trace | void | Promise<Trace | void>;
+}
+
+/** Plugin extension point with metadata, lifecycle hooks, and custom interceptors. */
+export interface GhostTracePlugin<TState extends PluginState = PluginState> {
+  /** Required stable plugin name used in diagnostics. */
+  readonly name: string;
+  /** Required plugin version used for compatibility diagnostics. */
+  readonly version: string;
+  /** Optional custom interceptors installed with the plugin. */
+  readonly interceptors?: readonly Interceptor[];
+  /** Optional lifecycle hooks invoked in registration order. */
+  readonly hooks?: PluginHooks<TState>;
+}
+
+/** Internal execution context used to associate plugin hooks with a tracer. */
+export interface PluginRuntimeContext {
+  /** Tracer or tracer-like object supplied to hook context. */
+  readonly tracer?: unknown;
+  /** Effective config supplied to hook context. */
+  readonly config?: GhostTraceConfig;
+}
+
 /** Top-level recorder configuration shared by the API, CLI, and integrations. */
 export interface GhostTraceConfig {
   /** Directory where traces should be read or written by higher-level features. */
@@ -133,6 +189,8 @@ export interface GhostTraceConfig {
   readonly interceptors?: readonly string[];
   /** Secret redaction settings applied before traces are persisted. */
   readonly redaction?: RedactionOptions;
+  /** Plugins to apply to records, replays, and tracer exports. */
+  readonly plugins?: readonly GhostTracePlugin[];
   /** Additional configuration reserved for plugins and future feature areas. */
   readonly metadata?: TraceMetadata;
 }
@@ -145,6 +203,10 @@ export interface RecordOptions {
   readonly interceptors?: readonly string[];
   /** Secret redaction settings applied before the recorded trace is returned or saved. */
   readonly redaction?: RedactionOptions;
+  /** Plugins to apply to this recording. */
+  readonly plugins?: readonly GhostTracePlugin[];
+  /** Internal plugin runtime context supplied by createTracer(). */
+  readonly pluginContext?: PluginRuntimeContext;
 }
 
 /** Options accepted by the foundation replay API placeholder. */
@@ -155,6 +217,10 @@ export interface ReplayOptions {
   readonly replayTypes?: readonly SpanType[];
   /** Maximum replay execution time in milliseconds before stubs are cleaned up and replay aborts. */
   readonly timeout?: number;
+  /** Plugins to apply to this replay. */
+  readonly plugins?: readonly GhostTracePlugin[];
+  /** Internal plugin runtime context supplied by createTracer(). */
+  readonly pluginContext?: PluginRuntimeContext;
 }
 
 /** Replay strategy used to associate a runtime call with a recorded span. */
@@ -188,6 +254,20 @@ export interface ReplayResult<TOutput = unknown, TSpan extends Span = Span> {
 /** A function that may be recorded or replayed by future engine features. */
 export type TraceableFunction<TOutput = unknown> = () => TOutput | Promise<TOutput>;
 
+/** Export options exposed on isolated tracer instances. */
+export interface TracerExportOptions {
+  /** Output format to produce. */
+  readonly format: string;
+  /** Optional output path. */
+  readonly output?: string;
+  /** Plugins to apply to this export. */
+  readonly plugins?: readonly GhostTracePlugin[];
+  /** Internal plugin runtime context supplied by createTracer(). */
+  readonly pluginContext?: PluginRuntimeContext;
+  /** Additional export-pipeline options forwarded to exportTrace(). */
+  readonly [key: string]: unknown;
+}
+
 /** Isolated GhostTrace API instance. */
 export interface Tracer {
   /** Configuration captured when the tracer was created. */
@@ -204,6 +284,8 @@ export interface Tracer {
     fn: TraceableFunction<TOutput>,
     options?: ReplayOptions
   ) => Promise<ReplayResult<Awaited<TOutput>, TSpan>>;
+  /** Exports a trace using this tracer's plugins and config. */
+  readonly exportTrace: (trace: Trace, options: TracerExportOptions) => Promise<string>;
   /** Validates and normalizes configuration. */
   readonly defineConfig: (config: GhostTraceConfig) => GhostTraceConfig;
 }
