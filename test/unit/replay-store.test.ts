@@ -157,6 +157,27 @@ describe('ReplayStore', () => {
     );
   });
 
+  it('does not match FS spans from different Windows drive letters', () => {
+    const cDriveSpan = span('span_fs_c', SpanType.Fs, 'fs.readFileSync', {
+      operation: 'readFile',
+      api: 'sync',
+      path: 'C:\\ghosttrace\\same-name.txt',
+      normalizedPath: 'C:/ghosttrace/same-name.txt',
+      options: { encoding: 'utf8' }
+    });
+    const store = createReplayStore(trace([cDriveSpan]));
+
+    expect(() =>
+      store.consumeSpan(SpanType.Fs, 'fs.readFileSync', {
+        operation: 'readFile',
+        api: 'sync',
+        path: 'D:\\ghosttrace\\same-name.txt',
+        normalizedPath: 'D:/ghosttrace/same-name.txt',
+        options: { encoding: 'utf8' }
+      })
+    ).toThrow(ReplayMismatchError);
+  });
+
   it('atomically consumes distinct spans across 100 concurrent async operations', async () => {
     const spans = Array.from({ length: 100 }, (_, index) =>
       span(`span_${String(index).padStart(3, '0')}`, SpanType.Http, 'fetch', { url: `/item/${index}` })

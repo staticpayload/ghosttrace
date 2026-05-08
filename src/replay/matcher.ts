@@ -261,7 +261,7 @@ function normalizeTracePath(value: unknown): unknown {
 
   return value
     .replace(/\\/gu, '/')
-    .replace(/^[A-Za-z]:\//u, '/')
+    .replace(/^([A-Za-z]):\//u, (_match, driveLetter: string) => `${driveLetter.toUpperCase()}:/`)
     .replace(/\/{2,}/gu, '/');
 }
 

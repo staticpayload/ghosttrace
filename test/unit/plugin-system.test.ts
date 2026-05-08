@@ -221,6 +221,16 @@ describe('plugin system', () => {
 
     expect(replayed.output).toBe('recorded-plugin-effect');
     expect(replayed.spansMatched.map((match) => match.span.id)).toContain(pluginSpan?.id);
+
+    runPluginEffect = () => 'changed-live-effect-partial';
+
+    const partialReplay = await tracer.replay(trace, () => runPluginEffect(), {
+      mode: 'partial',
+      replayTypes: [PLUGIN_SPAN_TYPE]
+    });
+
+    expect(partialReplay.output).toBe('recorded-plugin-effect');
+    expect(partialReplay.spansMatched.map((match) => match.span.id)).toContain(pluginSpan?.id);
   });
 
   it('catches hook errors with warnings and keeps operations running', async () => {

@@ -177,7 +177,7 @@ function pathString(value: unknown): string {
 function normalizeFilePathForTrace(value: unknown): string {
   return pathString(value)
     .replace(/\\/gu, '/')
-    .replace(/^[A-Za-z]:\//u, '/')
+    .replace(/^([A-Za-z]):\//u, (_match, driveLetter: string) => `${driveLetter.toUpperCase()}:/`)
     .replace(/\/{2,}/gu, '/');
 }
 

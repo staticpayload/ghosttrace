@@ -316,6 +316,12 @@ describe('cross-area resilience and configuration flows', () => {
       'utf8'
     );
 
+    const initialized = runGhost(root, ['init'], cliTestTimeoutMs);
+
+    expect(initialized.status).toBe(0);
+    expect(initialized.stdout).toContain('ghosttrace.config.ts already exists');
+    expect(existsSync(join(root, '__ghosttraces__'))).toBe(true);
+
     const autoDiscovered = runGhost(nestedProject, ['record', './flow.ts', 'run', '--args', '[3]'], cliTestTimeoutMs);
 
     expect(autoDiscovered.status).toBe(0);

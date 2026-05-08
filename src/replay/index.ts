@@ -46,6 +46,8 @@ const replayInterceptors: readonly ReplayInterceptorEntry[] = [
   { type: SpanType.Performance, interceptor: performanceInterceptor }
 ];
 
+const builtInReplaySpanTypes: ReadonlySet<SpanType> = new Set(replayInterceptors.map((entry) => entry.type));
+
 let nextReplaySessionSequence = 1;
 
 function monotonicNow(): number {
@@ -511,7 +513,11 @@ function shouldInstallReplayInterceptor(type: SpanType, options: ReplayOptions):
 }
 
 function shouldInstallPluginReplayInterceptor(options: ReplayOptions): boolean {
-  return options.mode !== 'partial';
+  if (options.mode !== 'partial') {
+    return true;
+  }
+
+  return (options.replayTypes ?? []).some((type) => !builtInReplaySpanTypes.has(type));
 }
 
 function installReplayInterceptors(

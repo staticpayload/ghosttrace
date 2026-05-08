@@ -320,6 +320,31 @@ describe('filesystem interceptor', () => {
     });
   });
 
+  it('preserves Windows drive letters when normalizing recorded paths', async () => {
+    const cDrivePath = 'C:\\ghosttrace\\same-name.txt';
+    const dDrivePath = 'D:\\ghosttrace\\same-name.txt';
+
+    const trace = await ghost.record(
+      'fs-windows-drive-normalization',
+      () => {
+        for (const filePath of [cDrivePath, dDrivePath]) {
+          try {
+            fs.readFileSync(filePath, 'utf8');
+          } catch {
+            // The files do not need to exist; this test only asserts the captured trace identity.
+          }
+        }
+      },
+      { interceptors: ['fs'] }
+    );
+
+    const normalizedPaths = fsSpans(trace.spans).map((span) =>
+      isRecord(span.input) ? span.input.normalizedPath : undefined
+    );
+
+    expect(normalizedPaths).toEqual(['C:/ghosttrace/same-name.txt', 'D:/ghosttrace/same-name.txt']);
+  });
+
   it('stores files larger than 256KB by SHA-256 contentRef while keeping 256KB inline', async () => {
     const root = await tempRoot();
     const inlinePath = join(root, 'inline.bin');
