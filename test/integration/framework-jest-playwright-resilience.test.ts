@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { SpanType, deserialize, type SerializedJsonValue, type Trace } from '../../src/index.js';
+import { ReplayMismatchError, SpanType, deserialize, serialize, type SerializedJsonValue, type Trace } from '../../src/index.js';
 import { withGhostTrace } from '../../src/integrations/jest.js';
 import { createGhostPlaywright, type GhostPlaywrightController } from '../../src/integrations/playwright.js';
 
@@ -68,6 +68,20 @@ function deserializeAs<TValue>(value: unknown): TValue {
 
 function rootOutput(trace: Trace): unknown {
   return trace.spans.find((span) => span.parentId === null && span.type === SpanType.Function)?.output;
+}
+
+function traceWithRootOutput(trace: Trace, output: unknown): Trace {
+  return {
+    ...trace,
+    spans: trace.spans.map((span) =>
+      span.parentId === null && span.type === SpanType.Function
+        ? {
+            ...span,
+            output: serialize(output)
+          }
+        : span
+    )
+  };
 }
 
 function createFakeResponse(state: FakeServerState): FakePlaywrightResponse {
@@ -193,6 +207,29 @@ describe('Jest and Playwright framework integrations', () => {
     expect(warnings).toMatch(/invalid|parse|missing/i);
   });
 
+  it('withGhostTrace compares replay output against the beforeReplay-transformed baseline', async () => {
+    const traceDir = join(createTempRoot('ghosttrace-jest-before-replay-transform-'), 'traces');
+    let currentValue = 'recorded-baseline';
+    const wrapped = withGhostTrace('Jest beforeReplay transformed trace', async () => currentValue, {
+      traceDir,
+      plugins: [
+        {
+          name: 'framework-before-replay-transform',
+          version: '1.0.0',
+          hooks: {
+            beforeReplay: (trace) => traceWithRootOutput(trace, 'transformed-baseline'),
+            afterReplay: (trace) => traceWithRootOutput(trace, 'after-replay-view')
+          }
+        }
+      ]
+    });
+
+    await expect(wrapped()).resolves.toBe('recorded-baseline');
+
+    currentValue = 'transformed-baseline';
+    await expect(wrapped()).resolves.toBe('transformed-baseline');
+  });
+
   it('interceptPage records real page network once and replays offline without contacting the server', async () => {
     const traceDir = join(createTempRoot('ghosttrace-playwright-integration-'), 'traces');
     const controller = createGhostPlaywright({ traceDir, traceName: 'Playwright network test' });
@@ -216,6 +253,23 @@ describe('Jest and Playwright framework integrations', () => {
     expect(replayHarness.fetchCount()).toBe(0);
     expect(replayedResponse.status).toBe(200);
     expect(String(replayedResponse.body)).toBe('{"phase":"record"}');
+  });
+
+  it('interceptPage raises a replay mismatch for unmatched requests instead of falling back to an unused span', async () => {
+    const traceDir = join(createTempRoot('ghosttrace-playwright-mismatch-'), 'traces');
+    const controller = createGhostPlaywright({ traceDir, traceName: 'Playwright mismatch test' });
+    const recordingHarness = createFakePage({ body: '{"phase":"record"}', fetchCount: 0 });
+
+    await controller.interceptPage(recordingHarness.page);
+    await recordingHarness.request('https://example.test/api/recorded');
+
+    const replayHarness = createFakePage({ body: '{"phase":"offline"}', offline: true, fetchCount: 0 });
+    await controller.interceptPage(replayHarness.page);
+
+    await expect(replayHarness.request('https://example.test/api/different')).rejects.toBeInstanceOf(
+      ReplayMismatchError
+    );
+    expect(replayHarness.fetchCount()).toBe(0);
   });
 
   it('interceptPage re-records corrupted traces with a warning instead of crashing', async () => {

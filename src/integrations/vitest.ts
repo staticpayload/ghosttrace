@@ -12,6 +12,16 @@ const requireFromIntegration = createRequire(import.meta.url);
 
 let cachedBaseTest: TestAPI | undefined;
 
+interface VitestTaskIdentity {
+  readonly name: string;
+  readonly fullName?: string;
+  readonly fullTestName?: string;
+  readonly file?: {
+    readonly filepath?: string;
+    readonly name?: string;
+  };
+}
+
 /** Options accepted by the Vitest integration entry point. */
 export interface GhostVitestOptions {
   /** Directory containing trace baselines. */
@@ -80,11 +90,30 @@ function createGhostContext(taskName: string, options: GhostVitestOptions): Ghos
   };
 }
 
+function firstNonEmptyString(...values: readonly (string | undefined)[]): string | undefined {
+  return values.find((value) => value !== undefined && value.length > 0);
+}
+
+function vitestTaskTraceName(task: VitestTaskIdentity): string {
+  const fullName = firstNonEmptyString(task.fullName);
+  if (fullName !== undefined) {
+    return fullName;
+  }
+
+  const testName = firstNonEmptyString(task.fullTestName, task.name);
+  const fileName = firstNonEmptyString(task.file?.filepath, task.file?.name);
+  if (fileName !== undefined && testName !== undefined && !testName.includes(fileName)) {
+    return `${fileName} > ${testName}`;
+  }
+
+  return testName ?? '';
+}
+
 /** Creates a Vitest test fixture with GhostTrace record/replay helpers. */
 export function ghostFixture(options: GhostVitestOptions = {}): TestAPI<{ ghost: GhostVitestContext }> {
   return loadVitestTestApi().extend<{ ghost: GhostVitestContext }>({
     ghost: async ({ task }, use): Promise<void> => {
-      await use(createGhostContext(task.fullTestName ?? task.fullName ?? task.name, options));
+      await use(createGhostContext(vitestTaskTraceName(task), options));
     }
   });
 }

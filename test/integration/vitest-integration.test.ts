@@ -1,5 +1,5 @@
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { SpanType, deserialize, ghost as ghostApi, type SerializedJsonValue, type Trace } from '../../src/index.js';
@@ -61,6 +61,10 @@ describe('ghostFixture Vitest integration', () => {
 
     const savedTrace = readTrace(ghost.traceFile);
     expect(savedTrace.spans.map((span) => span.type)).toContain(SpanType.Env);
+  });
+
+  ghostTest('uses file-qualified Vitest task identity when deriving trace filenames', async ({ ghost }) => {
+    expect(basename(ghost.traceFile)).toContain('test-integration');
   });
 
   ghostTest('replays an existing baseline and fails with details when output diverges', async ({ ghost }) => {

@@ -217,8 +217,8 @@ async function replayBaseline<TOutput>(
   state.spans = replayed.spansMatched.map((match) => match.span);
   state.hasBaseline = true;
 
-  if (!isDeepStrictEqual(rootOutput(baseline), serialize(replayed.output))) {
-    throw replayOutputMismatchError(baseline, traceFile, replayed.output);
+  if (!isDeepStrictEqual(rootOutput(replayed.replayTrace), serialize(replayed.output))) {
+    throw replayOutputMismatchError(replayed.replayTrace, traceFile, replayed.output);
   }
 
   return replayed.output;

@@ -362,4 +362,38 @@ describe('plugin system', () => {
 
     expect(parsed.metadata?.directFormat).toBe('json');
   });
+
+  it('threads afterReplay returned trace transforms through the replay result', async () => {
+    const trace = await ghost.record('after-replay-result-trace', () => 'ok');
+
+    const replayed = await ghost.replay(trace, () => 'ok', {
+      plugins: [
+        {
+          name: 'after-replay-result-transform',
+          version: '1.0.0',
+          hooks: {
+            beforeReplay: (incomingTrace) => ({
+              ...incomingTrace,
+              metadata: {
+                ...incomingTrace.metadata,
+                beforeReplayVisible: true
+              }
+            }),
+            afterReplay: (incomingTrace) => ({
+              ...incomingTrace,
+              metadata: {
+                ...incomingTrace.metadata,
+                afterReplayVisible: true
+              }
+            })
+          }
+        }
+      ]
+    });
+
+    expect(replayed.trace.metadata.beforeReplayVisible).toBe(true);
+    expect(replayed.trace.metadata.afterReplayVisible).toBe(true);
+    expect(replayed.replayTrace.metadata.beforeReplayVisible).toBe(true);
+    expect(replayed.replayTrace.metadata.afterReplayVisible).toBeUndefined();
+  });
 });

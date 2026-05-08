@@ -429,18 +429,24 @@ function consumeReplaySpan(
 ): Span {
   const httpSpans = trace.spans.filter((span) => span.type === SpanType.Http);
   const matchedSpan = httpSpans.find((span) => !consumedSpanIds.has(span.id) && requestMatches(spanInput(span), input));
-  const fallbackSpan = httpSpans.find((span) => !consumedSpanIds.has(span.id));
-  const span = matchedSpan ?? fallbackSpan;
 
-  if (span === undefined) {
+  if (matchedSpan === undefined) {
     throw new ReplayMismatchError('No recorded Playwright network response matched the intercepted request', {
       traceId: trace.id,
-      context: { input }
+      context: {
+        input,
+        availableRequests: httpSpans
+          .filter((span) => !consumedSpanIds.has(span.id))
+          .map((span) => ({
+            id: span.id,
+            input: spanInput(span)
+          }))
+      }
     });
   }
 
-  consumedSpanIds.add(span.id);
-  return span;
+  consumedSpanIds.add(matchedSpan.id);
+  return matchedSpan;
 }
 
 async function replayRoute(

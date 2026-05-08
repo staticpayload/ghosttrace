@@ -243,6 +243,10 @@ export interface ReplaySpanMatch<TSpan extends Span = Span> {
 export interface ReplayResult<TOutput = unknown, TSpan extends Span = Span> {
   /** Function output produced during replay. */
   readonly output: TOutput;
+  /** Trace used for replay after replay lifecycle hook transformations. */
+  readonly trace: Trace<TSpan>;
+  /** Trace that drove replay matching after beforeReplay hook transformations. */
+  readonly replayTrace: Trace<TSpan>;
   /** Spans matched during replay. */
   readonly spansMatched: readonly ReplaySpanMatch<TSpan>[];
   /** Original trace duration in milliseconds. */

@@ -664,6 +664,7 @@ export async function replay<TOutput, TSpan extends Span = Span>(
   });
   const startedAt = monotonicNow();
   let output: Awaited<TOutput>;
+  let replayResultTrace: Trace<TSpan> = trace;
 
   await runWithTraceContext(context, async () => {
     const teardowns = installReplayInterceptors(options, additionalPluginInterceptors);
@@ -685,9 +686,9 @@ export async function replay<TOutput, TSpan extends Span = Span>(
           );
         }
       }
-      await runTracePluginHooks(pluginRuntime, 'afterReplay', trace, {
+      replayResultTrace = await runTracePluginHooks(pluginRuntime, 'afterReplay', trace, {
         operation: 'replay'
-      });
+      }) as Trace<TSpan>;
     } finally {
       teardownReplayInterceptors(teardowns);
     }
@@ -695,6 +696,8 @@ export async function replay<TOutput, TSpan extends Span = Span>(
 
   return {
     output: output!,
+    trace: replayResultTrace,
+    replayTrace: trace,
     spansMatched: replayStore.matchedSpans(),
     originalDuration: trace.duration,
     replayDuration: monotonicNow() - startedAt

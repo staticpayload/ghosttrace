@@ -175,12 +175,15 @@ describe('core data model types', () => {
 
     const replayResult = {
       output: { ok: true, value: 3 } as const,
+      trace: baseTrace,
+      replayTrace: baseTrace,
       spansMatched: [matchedSpan],
       originalDuration: 3,
       replayDuration: 1
     } satisfies ReplayResult<{ readonly ok: true; readonly value: 3 }, typeof baseSpan>;
 
     expectTypeOf(replayResult.output).toEqualTypeOf<{ readonly ok: true; readonly value: 3 }>();
+    expectTypeOf(replayResult.trace.spans[0]).toEqualTypeOf<typeof baseSpan | undefined>();
     expectTypeOf(replayResult.spansMatched[0]).toMatchTypeOf<
       ReplaySpanMatch<typeof baseSpan> | undefined
     >();
@@ -262,6 +265,8 @@ describe('core data model types', () => {
     expectTypeOf<GhostReplayResult['spansMatched'][number]['span']['customKind']>().toEqualTypeOf<
       'http-fixture'
     >();
+    expectTypeOf<GhostReplayResult['trace']['spans'][number]>().toEqualTypeOf<CustomReplaySpan>();
+    expectTypeOf<GhostReplayResult['replayTrace']['spans'][number]>().toEqualTypeOf<CustomReplaySpan>();
     expectTypeOf<
       TracerReplayResult['spansMatched'][number]['span']['metadata']['requestId']
     >().toEqualTypeOf<string>();
